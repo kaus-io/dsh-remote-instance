@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,7 +7,11 @@ import { after, describe, it } from 'node:test'
 import { startBridge } from '../index.js'
 
 const disposable = []
-after(async () => { for (const close of disposable.reverse()) await close() })
+const directories = []
+after(async () => {
+  for (const close of disposable.reverse()) await close()
+  for (const directory of directories) await rm(directory, { recursive: true, force: true })
+})
 
 async function freePort() {
   const server = createServer()
@@ -32,6 +36,7 @@ function fakeHost(prompts) {
 describe('bridge service', () => {
   it('requires the token and serves info, sessions, prompt, and empty history', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'ri-bridge-'))
+    directories.push(dir)
     const dshHome = join(dir, '.dsh')
     await mkdir(join(dshHome, 'sessions', 'grp', 'sess1'), { recursive: true })
     const prompts = []
@@ -83,6 +88,7 @@ describe('bridge service', () => {
 
   it('stays inert when the port is zero', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'ri-bridge-'))
+    directories.push(dir)
     const bridge = await startBridge(fakeHost([]), { port: 0, tokenFile: join(dir, 'token'), dshHome: dir })
     assert.equal(bridge.port, 0)
     await bridge.close()
