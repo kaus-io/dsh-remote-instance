@@ -24,9 +24,9 @@ async function freePort() {
 function fakeHost(prompts) {
   return {
     get: name => name !== 'sessionController' ? undefined : {
-      list: async () => ({ items: [{ sessionId: 'sess1', cwd: '/home/me/proj', updatedAt: 7, running: false, blank: false, agentAvailable: true }, { junk: true }] }),
+      list: async (_request, signal) => { if (!signal) throw new Error('list needs a signal'); return ({ items: [{ sessionId: 'sess1', cwd: '/home/me/proj', updatedAt: 7, running: false, blank: false, agentAvailable: true }, { junk: true }] }) },
       create: async ({ cwd }) => ({ sessionId: cwd ? 'sess-created' : 'sess-blank' }),
-      prompt: async request => { prompts.push(request); return { accepted: true } },
+      prompt: async (request, signal) => { if (!signal) throw new Error('prompt needs a signal'); prompts.push(request); return { accepted: true } },
       cancel: async () => ({ accepted: true }),
     },
     logger: { warn: () => {} },

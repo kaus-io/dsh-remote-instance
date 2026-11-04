@@ -24,7 +24,7 @@ export interface SessionControllerLike {
     readonly sessionId: string
     readonly mode: 'queue' | 'steer'
     readonly content: readonly unknown[]
-  }): Promise<{ readonly accepted: true }>
+  }, signal?: AbortSignal): Promise<{ readonly accepted: true }>
   cancel(request: { readonly sessionId: string }): unknown
 }
 
@@ -201,7 +201,7 @@ export async function startBridge(ctx: BridgeHost, options: BridgeOptions): Prom
       if (route === 'GET /v1/sessions') {
         const sessions = controller()
         if (!sessions) return sendError(res, 503, 'this host has no session controller')
-        const listed = await sessions.list({})
+        const listed = await sessions.list({}, new AbortController().signal)
         const rows = listed.items.map(sessionRow).filter((row): row is SessionRow => row !== undefined)
         return sendJson(res, 200, { ok: true, sessions: rows })
       }
@@ -236,7 +236,7 @@ export async function startBridge(ctx: BridgeHost, options: BridgeOptions): Prom
           sessionId,
           mode: 'queue',
           content: [{ type: 'text', text }],
-        })
+        }, new AbortController().signal)
         return sendJson(res, 200, { ok: true, accepted: true })
       }
 

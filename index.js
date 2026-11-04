@@ -485,7 +485,7 @@ async function startBridge(ctx, options) {
       if (route === "GET /v1/sessions") {
         const sessions = controller();
         if (!sessions) return sendError(res, 503, "this host has no session controller");
-        const listed = await sessions.list({});
+        const listed = await sessions.list({}, new AbortController().signal);
         const rows = listed.items.map(sessionRow).filter((row) => row !== void 0);
         return sendJson(res, 200, { ok: true, sessions: rows });
       }
@@ -517,7 +517,7 @@ async function startBridge(ctx, options) {
           sessionId,
           mode: "queue",
           content: [{ type: "text", text }]
-        });
+        }, new AbortController().signal);
         return sendJson(res, 200, { ok: true, accepted: true });
       }
       if (route === "POST /v1/cancel") {
