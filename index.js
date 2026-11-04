@@ -1,17 +1,558 @@
+// src/bridge.ts
+import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+import { chmod, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
+import { dirname, join } from "node:path";
+
+// src/history.ts
+import { zstdDecompressSync } from "node:zlib";
+
+// src/shell.ts
+var CONTROL = /[\u0000-\u001f\u007f]/;
+function assertPlain(value, label) {
+  if (typeof value !== "string" || CONTROL.test(value)) throw new Error(`${label} must be a string without control characters`);
+  return value;
+}
+function shellQuote(value) {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error("value must be a string without NUL characters");
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+function sshTargetOf(instance) {
+  return {
+    host: instance.host,
+    ...instance.user === void 0 ? {} : { user: instance.user },
+    ...instance.port === void 0 ? {} : { port: instance.port },
+    ...instance.identityFile === void 0 ? {} : { identityFile: instance.identityFile },
+    ...instance.proxyJump === void 0 ? {} : { proxyJump: instance.proxyJump }
+  };
+}
+function sshArgv(target, remoteCommand, options) {
+  if (typeof remoteCommand !== "string" || remoteCommand.includes("\0")) throw new Error("remote command must be a string without NUL characters");
+  if (!target.host) throw new Error("host is required");
+  if (target.host.startsWith("-")) throw new Error("host must not start with -");
+  const auth = options.auth ?? "key";
+  const argv = [
+    "ssh",
+    "-T",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    `ConnectTimeout=${Math.max(1, Math.ceil(options.connectTimeoutMs / 1e3))}`,
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4"
+  ];
+  if (auth === "password") {
+    argv.push("-o", "BatchMode=no", "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "NumberOfPasswordPrompts=1");
+  } else {
+    argv.push("-o", "BatchMode=yes");
+  }
+  if (target.port !== void 0) argv.push("-p", String(target.port));
+  if (target.identityFile) argv.push("-i", assertPlain(target.identityFile, "identityFile"));
+  if (target.proxyJump) argv.push("-J", assertPlain(target.proxyJump, "proxyJump"));
+  if (target.user) argv.push("-l", assertPlain(target.user, "user"));
+  argv.push("--", target.host, remoteCommand);
+  return argv;
+}
+function parseProbeOutput(stdout) {
+  const facts = {};
+  for (const raw of stdout.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (!line.startsWith("probe	")) continue;
+    const [, key, ...rest] = line.split("	");
+    if (!key || rest.length === 0) continue;
+    const value = rest.join("	").trim();
+    if (value) facts[key] = value;
+  }
+  const platform = facts.platform === "windows" ? "windows" : facts.platform === "posix" ? "posix" : void 0;
+  return {
+    ...facts.version === void 0 ? {} : { version: facts.version },
+    ...facts.os === void 0 ? {} : { os: facts.os },
+    ...facts.path === void 0 ? {} : { dshPath: facts.path },
+    ...facts.home === void 0 ? {} : { dshHome: facts.home },
+    ...facts.cwd === void 0 ? {} : { cwd: facts.cwd },
+    ...facts.profile === void 0 ? {} : { profile: facts.profile },
+    ...platform === void 0 ? {} : { platform }
+  };
+}
+var ASKPASS_SCRIPT = `#!/bin/sh
+printf '%s\\n' "\${DSH_REMOTE_PASSWORD-}"
+`;
+function askpassEnv(helperPath) {
+  return {
+    SSH_ASKPASS: helperPath,
+    SSH_ASKPASS_REQUIRE: "force",
+    DISPLAY: ":0"
+  };
+}
+
+// src/platform.ts
+function psQuote(value) {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error("value must be a string without NUL characters");
+  return `'${value.replace(/'/g, "''")}'`;
+}
+function encodePowerShell(script) {
+  return Buffer.from(script, "utf16le").toString("base64");
+}
+function powershellCommand(script) {
+  return `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodePowerShell(script)}`;
+}
+function requireSessionId(sessionId) {
+  if (sessionId === void 0) return void 0;
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) throw new Error("sessionId may only contain A-Za-z0-9, _ and -");
+  return sessionId;
+}
+function posixTaskScript(instance, sessionId) {
+  const steps = [];
+  if (instance.cwd) steps.push(`cd -- ${shellQuote(instance.cwd)}`);
+  const argv = [instance.dsh, "--profile", instance.profile, "--json"];
+  const id = requireSessionId(sessionId);
+  if (id !== void 0) argv.push("--session-id", id);
+  steps.push(`exec ${argv.map((value) => shellQuote(value)).join(" ")}`);
+  return steps.join(" && ");
+}
+function posixTaskCommand(instance, sessionId) {
+  const script = posixTaskScript(instance, sessionId);
+  if (!instance.shell) return script;
+  return `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
+}
+function posixProbeScript(instance) {
+  const dsh = shellQuote(instance.dsh);
+  return [
+    'home="${DSH_HOME:-$HOME/.dsh}"',
+    `printf 'probe\\tversion\\t%s\\n' "$(${dsh} --version 2>&1 | head -n 1)"`,
+    `printf 'probe\\tos\\t%s\\n' "$(uname -srm 2>&1)"`,
+    `printf 'probe\\tpath\\t%s\\n' "$(command -v ${dsh} 2>/dev/null || printf missing)"`,
+    `printf 'probe\\thome\\t%s\\n' "$home"`,
+    `printf 'probe\\tcwd\\t%s\\n' "$(pwd)"`,
+    `printf 'probe\\tprofile\\t%s\\n' "$([ -f "$home/profiles/${instance.profile}/package.json" ] && printf present || printf missing)"`,
+    "printf 'probe\\tplatform\\tposix\\n'"
+  ].join("\n");
+}
+function posixProbeCommand(instance) {
+  const script = posixProbeScript(instance);
+  if (!instance.shell) return script;
+  return `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
+}
+function windowsProbeScript(instance) {
+  return [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
+    "$t = [char]9",
+    `$dsh = ${psQuote(instance.dsh)}`,
+    "if ($env:DSH_HOME) { $home = $env:DSH_HOME } else { $home = Join-Path $env:USERPROFILE '.dsh' }",
+    "$cmd = Get-Command $dsh | Select-Object -First 1",
+    `"probe\${t}version\${t}$(& $dsh --version 2>&1 | Select-Object -First 1)"`,
+    `"probe\${t}os\${t}$([Environment]::OSVersion.VersionString)"`,
+    `"probe\${t}path\${t}$(if ($cmd) { $cmd.Source } else { 'missing' })"`,
+    `"probe\${t}home\${t}$home"`,
+    `"probe\${t}cwd\${t}$((Get-Location).Path)"`,
+    `"probe\${t}profile\${t}$(if (Test-Path (Join-Path $home 'profiles/${instance.profile}/package.json')) { 'present' } else { 'missing' })"`,
+    `"probe\${t}platform\${t}windows"`
+  ].join("\n");
+}
+function windowsProbeCommand(instance) {
+  return powershellCommand(windowsProbeScript(instance));
+}
+function windowsTaskScript(instance, sessionId) {
+  const lines = [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8"
+  ];
+  if (instance.cwd) lines.push(`Set-Location -LiteralPath ${psQuote(instance.cwd)}`);
+  const args = [instance.dsh, "--profile", instance.profile, "--json"];
+  const id = requireSessionId(sessionId);
+  if (id !== void 0) args.push("--session-id", id);
+  lines.push(`& ${args.map(psQuote).join(" ")}`);
+  lines.push("if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }");
+  return lines.join("\n");
+}
+function windowsTaskCommand(instance, sessionId) {
+  return powershellCommand(windowsTaskScript(instance, sessionId));
+}
+function posixAcpCommand(instance) {
+  const steps = [];
+  if (instance.cwd) steps.push(`cd -- ${shellQuote(instance.cwd)}`);
+  steps.push(`exec ${shellQuote(instance.dsh)} ${shellQuote("--profile")} ${shellQuote("acp")}`);
+  const script = steps.join(" && ");
+  return instance.shell === "" ? script : `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
+}
+function windowsAcpCommand(instance) {
+  const lines = [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8"
+  ];
+  if (instance.cwd) lines.push(`Set-Location -LiteralPath ${psQuote(instance.cwd)}`);
+  lines.push(`& ${[instance.dsh, "--profile", "acp"].map(psQuote).join(" ")}`);
+  lines.push("exit $LASTEXITCODE");
+  return powershellCommand(lines.join("\n"));
+}
+function acpCommand(instance, platform) {
+  return platform === "windows" ? windowsAcpCommand(instance) : posixAcpCommand(instance);
+}
+function taskCommand(instance, platform, sessionId) {
+  return platform === "windows" ? windowsTaskCommand(instance, sessionId) : posixTaskCommand(instance, sessionId);
+}
+function probeCommand(instance, platform) {
+  return platform === "windows" ? windowsProbeCommand(instance) : posixProbeCommand(instance);
+}
+
+// src/history.ts
+var MAX_LOG_BYTES = 8 * 1024 * 1024;
+var MAX_MESSAGES = 240;
+var MAX_TEXT = 2e4;
+var MAGIC = [40, 181, 47, 253];
+function decompressFrames(buffer) {
+  if (buffer.length === 0) return "";
+  const starts = [];
+  for (let index = 0; index + 4 <= buffer.length; index += 1) {
+    if (buffer[index] === MAGIC[0] && buffer[index + 1] === MAGIC[1] && buffer[index + 2] === MAGIC[2] && buffer[index + 3] === MAGIC[3]) starts.push(index);
+  }
+  if (starts.length === 0) throw new Error("the session log has no zstd frame");
+  let text = "";
+  for (let index = 0; index < starts.length; index += 1) {
+    const from = starts[index];
+    const to = starts[index + 1] ?? buffer.length;
+    try {
+      text += zstdDecompressSync(buffer.subarray(from, to)).toString("utf8");
+    } catch {
+    }
+  }
+  return text;
+}
+function textOfBlocks(blocks, kinds) {
+  if (!Array.isArray(blocks)) return "";
+  const parts = [];
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    const source = block;
+    if (typeof source.type !== "string" || !kinds.includes(source.type)) continue;
+    if (typeof source.text === "string" && source.text) parts.push(source.text);
+  }
+  return parts.join("");
+}
+function brief(value, limit = 200) {
+  let text;
+  try {
+    text = typeof value === "string" ? value : JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  text = (text ?? "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit)}\u2026` : text;
+}
+function parseSessionLog(text) {
+  const messages = [];
+  let sessionId;
+  let cwd;
+  let createdAt;
+  let events = 0;
+  const push = (message) => {
+    if (!message.text) return;
+    const last = messages[messages.length - 1];
+    if (last && last.role === message.role && last.id === void 0 && message.id === void 0 && message.role !== "tool") {
+      messages[messages.length - 1] = { ...last, text: (last.text + message.text).slice(-MAX_TEXT) };
+      return;
+    }
+    messages.push({ ...message, text: message.text.slice(0, MAX_TEXT) });
+    if (messages.length > MAX_MESSAGES) messages.splice(0, messages.length - MAX_MESSAGES);
+  };
+  for (const line of text.split("\n")) {
+    const raw = line.trim();
+    if (!raw) continue;
+    let event;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") continue;
+      event = parsed;
+    } catch {
+      continue;
+    }
+    events += 1;
+    const data = event.data ?? {};
+    if (event.type === "session") {
+      if (typeof event.id === "string") sessionId = event.id;
+      if (typeof event.cwd === "string") cwd = event.cwd;
+      if (typeof event.createdAt === "number") createdAt = event.createdAt;
+      continue;
+    }
+    const at = typeof event.time === "number" ? event.time : void 0;
+    switch (event.type) {
+      case "user/message": {
+        const body = textOfBlocks(data.content, ["text"]);
+        push({ role: "user", text: body, ...at === void 0 ? {} : { at } });
+        break;
+      }
+      case "assistant/message": {
+        const message = data.message ?? {};
+        const body = textOfBlocks(message.content, ["text"]);
+        const thought = textOfBlocks(message.content, ["reasoning"]);
+        if (thought) push({ role: "thought", text: thought, ...at === void 0 ? {} : { at } });
+        if (body) push({ role: "assistant", text: body, ...at === void 0 ? {} : { at } });
+        break;
+      }
+      case "tool/call": {
+        const name2 = typeof data.name === "string" ? data.name : "tool";
+        const args = brief(data.arguments);
+        push({
+          role: "tool",
+          text: `${name2}${args && args !== "{}" ? ` ${args}` : ""}`,
+          at: at ?? Date.now(),
+          ...typeof data.callId === "string" ? { id: data.callId } : {},
+          status: "called"
+        });
+        break;
+      }
+      case "tool/result": {
+        const id = typeof data.toolCallId === "string" ? data.toolCallId : void 0;
+        if (id === void 0) break;
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+          const message = messages[index];
+          if (!message || message.id !== id) continue;
+          messages[index] = { ...message, status: "done" };
+          break;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return { messages, events, ...sessionId === void 0 ? {} : { sessionId }, ...cwd === void 0 ? {} : { cwd }, ...createdAt === void 0 ? {} : { createdAt } };
+}
+function historyCommand(platform, home, sessionId, limit = MAX_LOG_BYTES) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) throw new Error("sessionId may only contain A-Za-z0-9, _ and -");
+  const base = home && home.trim() ? home.trim() : "${DSH_HOME:-$HOME/.dsh}";
+  if (platform === "windows") {
+    const script2 = [
+      "$ErrorActionPreference = 'SilentlyContinue'",
+      "$ProgressPreference = 'SilentlyContinue'",
+      "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
+      `$home = ${home && home.trim() ? psQuote(home.trim()) : `if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }`}`,
+      `$sid = ${psQuote(sessionId)}`,
+      `$dir = Get-ChildItem (Join-Path $home 'sessions') -Directory | ForEach-Object { Get-ChildItem $_.FullName -Directory } | Where-Object { $_.Name -eq $sid } | Select-Object -First 1`,
+      "if ($dir) { $chunks = @(); $size = 0; Get-ChildItem $dir.FullName -Filter *.jsonl.zstd | Sort-Object Name | ForEach-Object { if ($size -lt " + String(limit) + ") { $bytes = [IO.File]::ReadAllBytes($_.FullName); $size += $bytes.Length; $chunks += $bytes } }; if ($chunks.Count -gt 0) { [Convert]::ToBase64String([byte[]]$chunks) } }"
+    ].join("\n");
+    return `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${Buffer.from(script2, "utf16le").toString("base64")}`;
+  }
+  const homeExpr = home && home.trim() ? shellQuote(home.trim()) : '"${DSH_HOME:-$HOME/.dsh}"';
+  const script = [
+    `home=${homeExpr}`,
+    `dir=$(find "$home/sessions" -mindepth 2 -maxdepth 2 -type d -name ${shellQuote(sessionId)} 2>/dev/null | head -n 1)`,
+    '[ -n "$dir" ] || exit 0',
+    `cat "$dir"/*.jsonl.zstd 2>/dev/null | head -c ${limit} | base64 | tr -d '\\n'`
+  ].join("\n");
+  return script;
+}
+
+// src/bridge.ts
+var BODY_LIMIT = 1048576;
+var SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
+function sendJson(res, status, value) {
+  if (res.writableEnded || res.destroyed) return;
+  const body = JSON.stringify(value);
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  res.end(body);
+}
+function sendError(res, status, message) {
+  sendJson(res, status, { ok: false, error: message });
+}
+function readBody(req, limit = BODY_LIMIT) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error("request body is too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+    req.on("aborted", () => reject(new Error("request aborted")));
+  });
+}
+async function ensureToken(file) {
+  try {
+    const existing = (await readFile(file, "utf8")).trim();
+    if (existing) return existing;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const token = randomBytes(32).toString("base64url");
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, `${token}
+`, { mode: 384 });
+  await chmod(file, 384);
+  return token;
+}
+async function sessionLogFiles(dshHome, sessionId) {
+  const root = join(dshHome, "sessions");
+  let groups;
+  try {
+    groups = await readdir(root);
+  } catch {
+    return [];
+  }
+  for (const group of groups) {
+    const directory = join(root, group, sessionId);
+    try {
+      if (!(await stat(directory)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    let names = [];
+    try {
+      names = (await readdir(directory)).filter((name2) => name2.endsWith(".jsonl.zstd")).sort();
+    } catch {
+      continue;
+    }
+    return names.map((name2) => join(directory, name2));
+  }
+  return [];
+}
+async function readHistory(dshHome, sessionId) {
+  const files = await sessionLogFiles(dshHome, sessionId);
+  if (files.length === 0) return { messages: [] };
+  let text = "";
+  for (const file of files) text += decompressFrames(await readFile(file));
+  const parsed = parseSessionLog(text);
+  return {
+    messages: parsed.messages,
+    ...parsed.cwd === void 0 ? {} : { cwd: parsed.cwd },
+    ...parsed.sessionId === void 0 ? {} : { sessionId: parsed.sessionId }
+  };
+}
+function sessionRow(value) {
+  if (!value || typeof value !== "object") return void 0;
+  const source = value;
+  if (typeof source.sessionId !== "string" || !source.sessionId) return void 0;
+  return {
+    sessionId: source.sessionId,
+    ...typeof source.cwd === "string" ? { cwd: source.cwd } : {},
+    ...typeof source.updatedAt === "number" ? { updatedAt: source.updatedAt } : {},
+    ...typeof source.running === "boolean" ? { running: source.running } : {},
+    ...typeof source.blank === "boolean" ? { blank: source.blank } : {},
+    ...typeof source.agentAvailable === "boolean" ? { agentAvailable: source.agentAvailable } : {}
+  };
+}
+async function startBridge(ctx, options) {
+  if (!Number.isSafeInteger(options.port) || options.port < 0 || options.port > 65535) throw new Error("bridge port must be 0-65535");
+  if (options.port === 0) return { port: 0, token: "", close: async () => void 0 };
+  const token = await ensureToken(options.tokenFile);
+  const host = options.host ?? "127.0.0.1";
+  const controller = () => {
+    const candidate = ctx.get("sessionController");
+    return candidate && typeof candidate === "object" ? candidate : void 0;
+  };
+  const server = createServer(async (req, res) => {
+    try {
+      if (req.headers.authorization !== `Bearer ${token}`) return sendError(res, 401, "missing or wrong bridge token");
+      const url = new URL(req.url ?? "/", `http://${host}`);
+      const route = `${req.method ?? "GET"} ${url.pathname}`;
+      if (route === "GET /v1/info") {
+        return sendJson(res, 200, {
+          ok: true,
+          hostname: hostname(),
+          platform: process.platform === "win32" ? "windows" : "posix",
+          dshHome: options.dshHome,
+          canPrompt: controller() !== void 0,
+          node: process.version
+        });
+      }
+      if (route === "GET /v1/sessions") {
+        const sessions = controller();
+        if (!sessions) return sendError(res, 503, "this host has no session controller");
+        const listed = await sessions.list({});
+        const rows = listed.items.map(sessionRow).filter((row) => row !== void 0);
+        return sendJson(res, 200, { ok: true, sessions: rows });
+      }
+      if (route === "GET /v1/history") {
+        const sessionId = url.searchParams.get("sessionId") ?? "";
+        if (!SESSION_ID.test(sessionId)) return sendError(res, 400, "invalid session id");
+        const history = await readHistory(options.dshHome, sessionId);
+        return sendJson(res, 200, { ok: true, source: history.messages.length > 0 ? "log" : "empty", ...history });
+      }
+      if (route === "POST /v1/create") {
+        const sessions = controller();
+        if (!sessions) return sendError(res, 503, "this host has no session controller");
+        const body = JSON.parse(await readBody(req) || "{}");
+        const cwd = typeof body.cwd === "string" && body.cwd ? body.cwd : void 0;
+        const created = await sessions.create(cwd === void 0 ? {} : { cwd });
+        return sendJson(res, 200, { ok: true, sessionId: created.sessionId });
+      }
+      if (route === "POST /v1/prompt") {
+        const sessions = controller();
+        if (!sessions) return sendError(res, 503, "this host has no session controller");
+        const body = JSON.parse(await readBody(req) || "{}");
+        const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+        const text = typeof body.text === "string" ? body.text : "";
+        if (!SESSION_ID.test(sessionId)) return sendError(res, 400, "invalid session id");
+        if (!text.trim()) return sendError(res, 400, "text is required");
+        if (text.length > 2e5) return sendError(res, 400, "text is too large");
+        await sessions.prompt({
+          requestId: randomBytes(16).toString("hex"),
+          sessionId,
+          mode: "queue",
+          content: [{ type: "text", text }]
+        });
+        return sendJson(res, 200, { ok: true, accepted: true });
+      }
+      if (route === "POST /v1/cancel") {
+        const sessions = controller();
+        if (!sessions) return sendError(res, 503, "this host has no session controller");
+        const body = JSON.parse(await readBody(req) || "{}");
+        const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+        if (!SESSION_ID.test(sessionId)) return sendError(res, 400, "invalid session id");
+        await sessions.cancel({ sessionId });
+        return sendJson(res, 200, { ok: true });
+      }
+      return sendError(res, 404, `unknown bridge route: ${route}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.logger?.warn(`remote-instance bridge: ${message}`);
+      if (!res.writableEnded) sendError(res, 500, message.slice(0, 2e3));
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(options.port, host, () => resolve());
+  });
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : options.port;
+  return {
+    port,
+    token,
+    close: () => new Promise((resolve) => {
+      server.close(() => resolve());
+    })
+  };
+}
+
 // src/http.ts
 var OBSERVE_PATH = "/remote-instance/observe";
 var ACTION_PATH = "/remote-instance/action";
 var UI_READ_ACTIONS = /* @__PURE__ */ new Set(["instances", "jobs", "status", "sessions", "history"]);
 var UI_ACTION_ACTIONS = /* @__PURE__ */ new Set(["add", "remove", "probe", "ask", "cancel", "new", "send", "stop", "close"]);
 var SESSION_ACTIONS = /* @__PURE__ */ new Set(["jobs", "status", "ask", "cancel"]);
-var BODY_LIMIT = 65536;
-function sendJson(res, status, value) {
+var BODY_LIMIT2 = 65536;
+function sendJson2(res, status, value) {
   if (res.writableEnded || res.destroyed) return void 0;
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   res.end(JSON.stringify(value));
   return void 0;
 }
-function readBody(req, limit, signal) {
+function readBody2(req, limit, signal) {
   return new Promise((resolve, reject) => {
     let size = 0;
     let settled = false;
@@ -54,16 +595,16 @@ function readBody(req, limit, signal) {
 function admitBrowser(service, req, res) {
   const connection = service.ctx.connection;
   if (!connection?.admit || !connection.browserPeer) {
-    sendJson(res, 503, { ok: false, error: "Browser authentication is unavailable" });
+    sendJson2(res, 503, { ok: false, error: "Browser authentication is unavailable" });
     return false;
   }
   const admission = connection.admit(req);
   if (admission.rejection) {
-    sendJson(res, admission.rejection.status ?? 403, { ok: false, error: "Browser authentication required" });
+    sendJson2(res, admission.rejection.status ?? 403, { ok: false, error: "Browser authentication required" });
     return false;
   }
   if (admission.peer?.id !== connection.browserPeer.id) {
-    sendJson(res, 403, { ok: false, error: "This endpoint requires the authenticated browser" });
+    sendJson2(res, 403, { ok: false, error: "This endpoint requires the authenticated browser" });
     return false;
   }
   return true;
@@ -118,16 +659,16 @@ function createObserveHandler(service, originOf) {
       if (req.headers["x-ri-observe"] !== "1") throw new Error("Missing remote instance observation header");
       const origin = originOf();
       if (origin && !sameLoopbackOrigin(req.headers.origin, origin)) throw new Error("Foreign origin");
-      const request = envelope(await readBody(req, BODY_LIMIT, controller.signal));
+      const request = envelope(await readBody2(req, BODY_LIMIT2, controller.signal));
       if (!UI_READ_ACTIONS.has(String(request.args.action))) throw new Error("This remote instance observation is not read-only");
       const agent = sessionOf(service, request);
       if (SESSION_ACTIONS.has(String(request.args.action)) && agent === void 0) throw new Error("This remote instance observation needs a session");
       const value = await service.execute(request.args, { source: "ui", signal: controller.signal, ...agent === void 0 ? {} : { agent } });
-      return sendJson(res, 200, { ok: true, value });
+      return sendJson2(res, 200, { ok: true, value });
     } catch (error) {
       if (res.writableEnded || res.destroyed) return void 0;
       const status = typeof error.status === "number" ? error.status : 400;
-      return sendJson(res, status, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4e3) });
+      return sendJson2(res, status, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4e3) });
     }
   };
 }
@@ -145,27 +686,27 @@ function createActionHandler(service, originOf) {
       if (!req.headers.origin) throw new Error("Missing remote instance action origin");
       const origin = originOf();
       if (origin && !sameLoopbackOrigin(req.headers.origin, origin)) throw new Error("Foreign origin");
-      const request = envelope(await readBody(req, BODY_LIMIT, controller.signal));
+      const request = envelope(await readBody2(req, BODY_LIMIT2, controller.signal));
       if (!UI_ACTION_ACTIONS.has(String(request.args.action))) throw new Error("This action is not available from the Settings panel");
       const agent = sessionOf(service, request);
       if (SESSION_ACTIONS.has(String(request.args.action)) && agent === void 0) throw new Error("This action needs a session");
       const value = await service.execute(request.args, { source: "ui", signal: controller.signal, ...agent === void 0 ? {} : { agent } });
-      return sendJson(res, 200, { ok: true, value });
+      return sendJson2(res, 200, { ok: true, value });
     } catch (error) {
       if (res.writableEnded || res.destroyed) return void 0;
       const status = typeof error.status === "number" ? error.status : 400;
-      return sendJson(res, status, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4e3) });
+      return sendJson2(res, status, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4e3) });
     }
   };
 }
 
 // src/settings.ts
 import { homedir } from "node:os";
-import { isAbsolute, join, normalize, sep } from "node:path";
+import { dirname as dirname3, isAbsolute, join as join2, normalize, sep } from "node:path";
 
 // src/instances.ts
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir as mkdir2, readFile as readFile2, rename, writeFile as writeFile2 } from "node:fs/promises";
+import { dirname as dirname2 } from "node:path";
 var NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 var PLAIN_TEXT = /[\u0000-\u001f\u007f]/;
 var HOST_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/;
@@ -303,7 +844,7 @@ var InstanceStore = class {
   async load() {
     let text;
     try {
-      text = await readFile(this.file, "utf8");
+      text = await readFile2(this.file, "utf8");
     } catch (error) {
       if (error.code === "ENOENT") return { instances: /* @__PURE__ */ new Map(), exists: false, skipped: [] };
       throw new Error(`Cannot read the remote instance list: ${error.message}`);
@@ -347,9 +888,9 @@ var InstanceStore = class {
   }
   async writeNow(instances) {
     const body = JSON.stringify({ version: 1, instances: [...instances.values()] }, null, 2) + "\n";
-    await mkdir(dirname(this.file), { recursive: true });
+    await mkdir2(dirname2(this.file), { recursive: true });
     const temporary = `${this.file}.${process.pid}.tmp`;
-    await writeFile(temporary, body, { encoding: "utf8", mode: 384 });
+    await writeFile2(temporary, body, { encoding: "utf8", mode: 384 });
     await rename(temporary, this.file);
   }
   serialize(operation) {
@@ -364,17 +905,18 @@ var LIMITS = {
   connectTimeoutMs: [1e3, 12e4, 1e4],
   probeTimeoutMs: [1e3, 3e5, 3e4],
   taskTimeoutMs: [1e4, 864e5, 36e5],
-  maxOutputBytes: [4096, 4194304, 262144]
+  maxOutputBytes: [4096, 4194304, 262144],
+  bridgePort: [0, 65535, 0]
 };
-var KNOWN_KEYS = /* @__PURE__ */ new Set(["storeFile", ...Object.keys(LIMITS), "instances"]);
+var KNOWN_KEYS = /* @__PURE__ */ new Set(["storeFile", "bridgeTokenFile", ...Object.keys(LIMITS), "instances"]);
 function expandHome(value) {
   if (value === "~") return homedir();
-  if (value.startsWith(`~${sep}`) || value.startsWith("~/") || value.startsWith("~\\")) return join(homedir(), value.slice(2));
+  if (value.startsWith(`~${sep}`) || value.startsWith("~/") || value.startsWith("~\\")) return join2(homedir(), value.slice(2));
   return value;
 }
 function resolveDshHome() {
   const configured = process.env.DSH_HOME?.trim();
-  return normalize(configured ? expandHome(configured) : join(homedir(), ".dsh"));
+  return normalize(configured ? expandHome(configured) : join2(homedir(), ".dsh"));
 }
 function displayPath(value) {
   const home = homedir();
@@ -395,9 +937,19 @@ function readInteger(source, key) {
   }
   return value;
 }
+function readBridgeTokenFile(source, storeFile) {
+  const value = source.bridgeTokenFile;
+  if (value === void 0) return join2(dirname3(storeFile), "remote-instance-bridge-token");
+  if (typeof value !== "string" || !value.trim() || value.length > 4096 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("remote-instance config: bridgeTokenFile must be a non-empty path");
+  }
+  const expanded = expandHome(value.trim());
+  if (!isAbsolute(expanded)) throw new Error("remote-instance config: bridgeTokenFile must be absolute or start with ~");
+  return normalize(expanded);
+}
 function readStoreFile(source) {
   const value = source.storeFile;
-  if (value === void 0) return join(resolveDshHome(), "remote-instances.json");
+  if (value === void 0) return join2(resolveDshHome(), "remote-instances.json");
   if (typeof value !== "string" || !value.trim() || value.length > 4096 || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error("remote-instance config: storeFile must be a non-empty path without control characters");
   }
@@ -423,14 +975,19 @@ function resolveSettings(config) {
     probeTimeoutMs: readInteger(source, "probeTimeoutMs"),
     taskTimeoutMs: readInteger(source, "taskTimeoutMs"),
     maxOutputBytes: readInteger(source, "maxOutputBytes"),
-    seed: seed === void 0 ? [] : seed
+    seed: seed === void 0 ? [] : seed,
+    bridgePort: readInteger(source, "bridgePort"),
+    bridgeTokenFile: readBridgeTokenFile(source, readStoreFile(source))
   };
 }
 
+// src/host.ts
+import { dirname as dirname5 } from "node:path";
+
 // src/service.ts
-import { chmod as chmod2, mkdtemp, rm, writeFile as writeFile3 } from "node:fs/promises";
-import { hostname, tmpdir } from "node:os";
-import { join as join2 } from "node:path";
+import { chmod as chmod3, mkdtemp, rm, writeFile as writeFile4 } from "node:fs/promises";
+import { hostname as hostname2, tmpdir } from "node:os";
+import { join as join3 } from "node:path";
 
 // src/acp.ts
 var CLIENT_NAME = "dsh-remote-instance";
@@ -667,7 +1224,7 @@ var AcpClient = class _AcpClient {
 // src/headless.ts
 var MAX_ANSWER = 2e5;
 var MAX_RAW = 1e6;
-function brief(value, limit = 160) {
+function brief2(value, limit = 160) {
   let text;
   try {
     text = typeof value === "string" ? value : JSON.stringify(value);
@@ -706,7 +1263,7 @@ function createTaskParser() {
       case "tool_call": {
         toolCalls += 1;
         const tool = typeof event.tool === "string" ? event.tool : "tool";
-        const input = brief(event.input);
+        const input = brief2(event.input);
         return [{ kind: "log", text: `
 \u25B8 ${tool}${input && input !== "{}" ? ` ${input}` : ""}
 ` }];
@@ -714,7 +1271,7 @@ function createTaskParser() {
       case "tool_result": {
         if (event.status !== "error") return [];
         return [{ kind: "error", text: `
-\u2717 ${brief(event.result, 400)}
+\u2717 ${brief2(event.result, 400)}
 ` }];
       }
       case "final": {
@@ -778,351 +1335,6 @@ ${errorText}
       };
     }
   };
-}
-
-// src/shell.ts
-var CONTROL = /[\u0000-\u001f\u007f]/;
-function assertPlain(value, label) {
-  if (typeof value !== "string" || CONTROL.test(value)) throw new Error(`${label} must be a string without control characters`);
-  return value;
-}
-function shellQuote(value) {
-  if (typeof value !== "string" || value.includes("\0")) throw new Error("value must be a string without NUL characters");
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-function sshTargetOf(instance) {
-  return {
-    host: instance.host,
-    ...instance.user === void 0 ? {} : { user: instance.user },
-    ...instance.port === void 0 ? {} : { port: instance.port },
-    ...instance.identityFile === void 0 ? {} : { identityFile: instance.identityFile },
-    ...instance.proxyJump === void 0 ? {} : { proxyJump: instance.proxyJump }
-  };
-}
-function sshArgv(target, remoteCommand, options) {
-  if (typeof remoteCommand !== "string" || remoteCommand.includes("\0")) throw new Error("remote command must be a string without NUL characters");
-  if (!target.host) throw new Error("host is required");
-  if (target.host.startsWith("-")) throw new Error("host must not start with -");
-  const auth = options.auth ?? "key";
-  const argv = [
-    "ssh",
-    "-T",
-    "-o",
-    "LogLevel=ERROR",
-    "-o",
-    "StrictHostKeyChecking=accept-new",
-    "-o",
-    `ConnectTimeout=${Math.max(1, Math.ceil(options.connectTimeoutMs / 1e3))}`,
-    "-o",
-    "ServerAliveInterval=15",
-    "-o",
-    "ServerAliveCountMax=4"
-  ];
-  if (auth === "password") {
-    argv.push("-o", "BatchMode=no", "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "NumberOfPasswordPrompts=1");
-  } else {
-    argv.push("-o", "BatchMode=yes");
-  }
-  if (target.port !== void 0) argv.push("-p", String(target.port));
-  if (target.identityFile) argv.push("-i", assertPlain(target.identityFile, "identityFile"));
-  if (target.proxyJump) argv.push("-J", assertPlain(target.proxyJump, "proxyJump"));
-  if (target.user) argv.push("-l", assertPlain(target.user, "user"));
-  argv.push("--", target.host, remoteCommand);
-  return argv;
-}
-function parseProbeOutput(stdout) {
-  const facts = {};
-  for (const raw of stdout.split("\n")) {
-    const line = raw.replace(/\r$/, "");
-    if (!line.startsWith("probe	")) continue;
-    const [, key, ...rest] = line.split("	");
-    if (!key || rest.length === 0) continue;
-    const value = rest.join("	").trim();
-    if (value) facts[key] = value;
-  }
-  const platform = facts.platform === "windows" ? "windows" : facts.platform === "posix" ? "posix" : void 0;
-  return {
-    ...facts.version === void 0 ? {} : { version: facts.version },
-    ...facts.os === void 0 ? {} : { os: facts.os },
-    ...facts.path === void 0 ? {} : { dshPath: facts.path },
-    ...facts.home === void 0 ? {} : { dshHome: facts.home },
-    ...facts.cwd === void 0 ? {} : { cwd: facts.cwd },
-    ...facts.profile === void 0 ? {} : { profile: facts.profile },
-    ...platform === void 0 ? {} : { platform }
-  };
-}
-var ASKPASS_SCRIPT = `#!/bin/sh
-printf '%s\\n' "\${DSH_REMOTE_PASSWORD-}"
-`;
-function askpassEnv(helperPath) {
-  return {
-    SSH_ASKPASS: helperPath,
-    SSH_ASKPASS_REQUIRE: "force",
-    DISPLAY: ":0"
-  };
-}
-
-// src/platform.ts
-function psQuote(value) {
-  if (typeof value !== "string" || value.includes("\0")) throw new Error("value must be a string without NUL characters");
-  return `'${value.replace(/'/g, "''")}'`;
-}
-function encodePowerShell(script) {
-  return Buffer.from(script, "utf16le").toString("base64");
-}
-function powershellCommand(script) {
-  return `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodePowerShell(script)}`;
-}
-function requireSessionId(sessionId) {
-  if (sessionId === void 0) return void 0;
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) throw new Error("sessionId may only contain A-Za-z0-9, _ and -");
-  return sessionId;
-}
-function posixTaskScript(instance, sessionId) {
-  const steps = [];
-  if (instance.cwd) steps.push(`cd -- ${shellQuote(instance.cwd)}`);
-  const argv = [instance.dsh, "--profile", instance.profile, "--json"];
-  const id = requireSessionId(sessionId);
-  if (id !== void 0) argv.push("--session-id", id);
-  steps.push(`exec ${argv.map((value) => shellQuote(value)).join(" ")}`);
-  return steps.join(" && ");
-}
-function posixTaskCommand(instance, sessionId) {
-  const script = posixTaskScript(instance, sessionId);
-  if (!instance.shell) return script;
-  return `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
-}
-function posixProbeScript(instance) {
-  const dsh = shellQuote(instance.dsh);
-  return [
-    'home="${DSH_HOME:-$HOME/.dsh}"',
-    `printf 'probe\\tversion\\t%s\\n' "$(${dsh} --version 2>&1 | head -n 1)"`,
-    `printf 'probe\\tos\\t%s\\n' "$(uname -srm 2>&1)"`,
-    `printf 'probe\\tpath\\t%s\\n' "$(command -v ${dsh} 2>/dev/null || printf missing)"`,
-    `printf 'probe\\thome\\t%s\\n' "$home"`,
-    `printf 'probe\\tcwd\\t%s\\n' "$(pwd)"`,
-    `printf 'probe\\tprofile\\t%s\\n' "$([ -f "$home/profiles/${instance.profile}/package.json" ] && printf present || printf missing)"`,
-    "printf 'probe\\tplatform\\tposix\\n'"
-  ].join("\n");
-}
-function posixProbeCommand(instance) {
-  const script = posixProbeScript(instance);
-  if (!instance.shell) return script;
-  return `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
-}
-function windowsProbeScript(instance) {
-  return [
-    "$ErrorActionPreference = 'SilentlyContinue'",
-    "$ProgressPreference = 'SilentlyContinue'",
-    "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
-    "$t = [char]9",
-    `$dsh = ${psQuote(instance.dsh)}`,
-    "if ($env:DSH_HOME) { $home = $env:DSH_HOME } else { $home = Join-Path $env:USERPROFILE '.dsh' }",
-    "$cmd = Get-Command $dsh | Select-Object -First 1",
-    `"probe\${t}version\${t}$(& $dsh --version 2>&1 | Select-Object -First 1)"`,
-    `"probe\${t}os\${t}$([Environment]::OSVersion.VersionString)"`,
-    `"probe\${t}path\${t}$(if ($cmd) { $cmd.Source } else { 'missing' })"`,
-    `"probe\${t}home\${t}$home"`,
-    `"probe\${t}cwd\${t}$((Get-Location).Path)"`,
-    `"probe\${t}profile\${t}$(if (Test-Path (Join-Path $home 'profiles/${instance.profile}/package.json')) { 'present' } else { 'missing' })"`,
-    `"probe\${t}platform\${t}windows"`
-  ].join("\n");
-}
-function windowsProbeCommand(instance) {
-  return powershellCommand(windowsProbeScript(instance));
-}
-function windowsTaskScript(instance, sessionId) {
-  const lines = [
-    "$ErrorActionPreference = 'Stop'",
-    "$ProgressPreference = 'SilentlyContinue'",
-    "[Console]::OutputEncoding = [Text.Encoding]::UTF8"
-  ];
-  if (instance.cwd) lines.push(`Set-Location -LiteralPath ${psQuote(instance.cwd)}`);
-  const args = [instance.dsh, "--profile", instance.profile, "--json"];
-  const id = requireSessionId(sessionId);
-  if (id !== void 0) args.push("--session-id", id);
-  lines.push(`& ${args.map(psQuote).join(" ")}`);
-  lines.push("if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }");
-  return lines.join("\n");
-}
-function windowsTaskCommand(instance, sessionId) {
-  return powershellCommand(windowsTaskScript(instance, sessionId));
-}
-function posixAcpCommand(instance) {
-  const steps = [];
-  if (instance.cwd) steps.push(`cd -- ${shellQuote(instance.cwd)}`);
-  steps.push(`exec ${shellQuote(instance.dsh)} ${shellQuote("--profile")} ${shellQuote("acp")}`);
-  const script = steps.join(" && ");
-  return instance.shell === "" ? script : `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
-}
-function windowsAcpCommand(instance) {
-  const lines = [
-    "$ErrorActionPreference = 'Stop'",
-    "$ProgressPreference = 'SilentlyContinue'",
-    "[Console]::OutputEncoding = [Text.Encoding]::UTF8"
-  ];
-  if (instance.cwd) lines.push(`Set-Location -LiteralPath ${psQuote(instance.cwd)}`);
-  lines.push(`& ${[instance.dsh, "--profile", "acp"].map(psQuote).join(" ")}`);
-  lines.push("exit $LASTEXITCODE");
-  return powershellCommand(lines.join("\n"));
-}
-function acpCommand(instance, platform) {
-  return platform === "windows" ? windowsAcpCommand(instance) : posixAcpCommand(instance);
-}
-function taskCommand(instance, platform, sessionId) {
-  return platform === "windows" ? windowsTaskCommand(instance, sessionId) : posixTaskCommand(instance, sessionId);
-}
-function probeCommand(instance, platform) {
-  return platform === "windows" ? windowsProbeCommand(instance) : posixProbeCommand(instance);
-}
-
-// src/history.ts
-import { zstdDecompressSync } from "node:zlib";
-var MAX_LOG_BYTES = 8 * 1024 * 1024;
-var MAX_MESSAGES = 240;
-var MAX_TEXT = 2e4;
-var MAGIC = [40, 181, 47, 253];
-function decompressFrames(buffer) {
-  if (buffer.length === 0) return "";
-  const starts = [];
-  for (let index = 0; index + 4 <= buffer.length; index += 1) {
-    if (buffer[index] === MAGIC[0] && buffer[index + 1] === MAGIC[1] && buffer[index + 2] === MAGIC[2] && buffer[index + 3] === MAGIC[3]) starts.push(index);
-  }
-  if (starts.length === 0) throw new Error("the session log has no zstd frame");
-  let text = "";
-  for (let index = 0; index < starts.length; index += 1) {
-    const from = starts[index];
-    const to = starts[index + 1] ?? buffer.length;
-    try {
-      text += zstdDecompressSync(buffer.subarray(from, to)).toString("utf8");
-    } catch {
-    }
-  }
-  return text;
-}
-function textOfBlocks(blocks, kinds) {
-  if (!Array.isArray(blocks)) return "";
-  const parts = [];
-  for (const block of blocks) {
-    if (!block || typeof block !== "object") continue;
-    const source = block;
-    if (typeof source.type !== "string" || !kinds.includes(source.type)) continue;
-    if (typeof source.text === "string" && source.text) parts.push(source.text);
-  }
-  return parts.join("");
-}
-function brief2(value, limit = 200) {
-  let text;
-  try {
-    text = typeof value === "string" ? value : JSON.stringify(value);
-  } catch {
-    text = String(value);
-  }
-  text = (text ?? "").replace(/\s+/g, " ").trim();
-  return text.length > limit ? `${text.slice(0, limit)}\u2026` : text;
-}
-function parseSessionLog(text) {
-  const messages = [];
-  let sessionId;
-  let cwd;
-  let createdAt;
-  let events = 0;
-  const push = (message) => {
-    if (!message.text) return;
-    const last = messages[messages.length - 1];
-    if (last && last.role === message.role && last.id === void 0 && message.id === void 0 && message.role !== "tool") {
-      messages[messages.length - 1] = { ...last, text: (last.text + message.text).slice(-MAX_TEXT) };
-      return;
-    }
-    messages.push({ ...message, text: message.text.slice(0, MAX_TEXT) });
-    if (messages.length > MAX_MESSAGES) messages.splice(0, messages.length - MAX_MESSAGES);
-  };
-  for (const line of text.split("\n")) {
-    const raw = line.trim();
-    if (!raw) continue;
-    let event;
-    try {
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object") continue;
-      event = parsed;
-    } catch {
-      continue;
-    }
-    events += 1;
-    const data = event.data ?? {};
-    if (event.type === "session") {
-      if (typeof event.id === "string") sessionId = event.id;
-      if (typeof event.cwd === "string") cwd = event.cwd;
-      if (typeof event.createdAt === "number") createdAt = event.createdAt;
-      continue;
-    }
-    const at = typeof event.time === "number" ? event.time : void 0;
-    switch (event.type) {
-      case "user/message": {
-        const body = textOfBlocks(data.content, ["text"]);
-        push({ role: "user", text: body, ...at === void 0 ? {} : { at } });
-        break;
-      }
-      case "assistant/message": {
-        const message = data.message ?? {};
-        const body = textOfBlocks(message.content, ["text"]);
-        const thought = textOfBlocks(message.content, ["reasoning"]);
-        if (thought) push({ role: "thought", text: thought, ...at === void 0 ? {} : { at } });
-        if (body) push({ role: "assistant", text: body, ...at === void 0 ? {} : { at } });
-        break;
-      }
-      case "tool/call": {
-        const name2 = typeof data.name === "string" ? data.name : "tool";
-        const args = brief2(data.arguments);
-        push({
-          role: "tool",
-          text: `${name2}${args && args !== "{}" ? ` ${args}` : ""}`,
-          at: at ?? Date.now(),
-          ...typeof data.callId === "string" ? { id: data.callId } : {},
-          status: "called"
-        });
-        break;
-      }
-      case "tool/result": {
-        const id = typeof data.toolCallId === "string" ? data.toolCallId : void 0;
-        if (id === void 0) break;
-        for (let index = messages.length - 1; index >= 0; index -= 1) {
-          const message = messages[index];
-          if (!message || message.id !== id) continue;
-          messages[index] = { ...message, status: "done" };
-          break;
-        }
-        break;
-      }
-      default:
-        break;
-    }
-  }
-  return { messages, events, ...sessionId === void 0 ? {} : { sessionId }, ...cwd === void 0 ? {} : { cwd }, ...createdAt === void 0 ? {} : { createdAt } };
-}
-function historyCommand(platform, home, sessionId, limit = MAX_LOG_BYTES) {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) throw new Error("sessionId may only contain A-Za-z0-9, _ and -");
-  const base = home && home.trim() ? home.trim() : "${DSH_HOME:-$HOME/.dsh}";
-  if (platform === "windows") {
-    const script2 = [
-      "$ErrorActionPreference = 'SilentlyContinue'",
-      "$ProgressPreference = 'SilentlyContinue'",
-      "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
-      `$home = ${home && home.trim() ? psQuote(home.trim()) : `if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }`}`,
-      `$sid = ${psQuote(sessionId)}`,
-      `$dir = Get-ChildItem (Join-Path $home 'sessions') -Directory | ForEach-Object { Get-ChildItem $_.FullName -Directory } | Where-Object { $_.Name -eq $sid } | Select-Object -First 1`,
-      "if ($dir) { $chunks = @(); $size = 0; Get-ChildItem $dir.FullName -Filter *.jsonl.zstd | Sort-Object Name | ForEach-Object { if ($size -lt " + String(limit) + ") { $bytes = [IO.File]::ReadAllBytes($_.FullName); $size += $bytes.Length; $chunks += $bytes } }; if ($chunks.Count -gt 0) { [Convert]::ToBase64String([byte[]]$chunks) } }"
-    ].join("\n");
-    return `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${Buffer.from(script2, "utf16le").toString("base64")}`;
-  }
-  const homeExpr = home && home.trim() ? shellQuote(home.trim()) : '"${DSH_HOME:-$HOME/.dsh}"';
-  const script = [
-    `home=${homeExpr}`,
-    `dir=$(find "$home/sessions" -mindepth 2 -maxdepth 2 -type d -name ${shellQuote(sessionId)} 2>/dev/null | head -n 1)`,
-    '[ -n "$dir" ] || exit 0',
-    `cat "$dir"/*.jsonl.zstd 2>/dev/null | head -c ${limit} | base64 | tr -d '\\n'`
-  ].join("\n");
-  return script;
 }
 
 // src/runner.ts
@@ -1196,8 +1408,8 @@ function createRunner(subprocess, options = {}) {
 }
 
 // src/secrets.ts
-import { chmod, mkdir as mkdir2, readFile as readFile2, rename as rename2, writeFile as writeFile2 } from "node:fs/promises";
-import { dirname as dirname2 } from "node:path";
+import { chmod as chmod2, mkdir as mkdir3, readFile as readFile3, rename as rename2, writeFile as writeFile3 } from "node:fs/promises";
+import { dirname as dirname4 } from "node:path";
 var MAX_SECRET = 4096;
 function secretsPathFor(storeFile) {
   return storeFile.endsWith(".json") ? `${storeFile.slice(0, -5)}.secrets.json` : `${storeFile}.secrets.json`;
@@ -1212,7 +1424,7 @@ var SecretStore = class {
   async load() {
     let text;
     try {
-      text = await readFile2(this.file, "utf8");
+      text = await readFile3(this.file, "utf8");
     } catch (error) {
       if (error.code === "ENOENT") return /* @__PURE__ */ new Map();
       throw new Error(`Cannot read the remote instance passwords: ${error.message}`);
@@ -1252,11 +1464,11 @@ var SecretStore = class {
     });
   }
   async write(passwords) {
-    await mkdir2(dirname2(this.file), { recursive: true });
+    await mkdir3(dirname4(this.file), { recursive: true });
     const temporary = `${this.file}.${process.pid}.tmp`;
     const body = JSON.stringify({ version: 1, passwords: Object.fromEntries(passwords) }, null, 2) + "\n";
-    await writeFile2(temporary, body, { encoding: "utf8", mode: 384 });
-    await chmod(temporary, 384);
+    await writeFile3(temporary, body, { encoding: "utf8", mode: 384 });
+    await chmod2(temporary, 384);
     await rename2(temporary, this.file);
   }
   serialize(operation) {
@@ -1462,7 +1674,7 @@ var RemoteInstanceService = class {
     const summaries = [...snapshot.instances.values()].sort((left, right) => left.name.localeCompare(right.name)).map((instance) => instanceSummary(this.withAuth(instance, passwords.has(instance.name))));
     return {
       store: this.storeDisplayPath,
-      local: { hostname: hostname(), platform: process.platform === "win32" ? "windows" : "posix" },
+      local: { hostname: hostname2(), platform: process.platform === "win32" ? "windows" : "posix" },
       instances: summaries,
       ...snapshot.skipped.length === 0 ? {} : { skipped: snapshot.skipped }
     };
@@ -2061,11 +2273,11 @@ ${message}
   async askpassHelper() {
     if (process.platform === "win32") throw new Error("password authentication needs a POSIX ssh client; on a Windows host use a key instead");
     if (this.askpassPath !== void 0) return this.askpassPath;
-    const directory = await mkdtemp(join2(tmpdir(), "dsh-ri-askpass-"));
-    await chmod2(directory, 448);
-    const file = join2(directory, "askpass.sh");
-    await writeFile3(file, ASKPASS_SCRIPT, { mode: 448 });
-    await chmod2(file, 448);
+    const directory = await mkdtemp(join3(tmpdir(), "dsh-ri-askpass-"));
+    await chmod3(directory, 448);
+    const file = join3(directory, "askpass.sh");
+    await writeFile4(file, ASKPASS_SCRIPT, { mode: 448 });
+    await chmod3(file, 448);
     this.askpassDirectory = directory;
     this.askpassPath = file;
     return file;
@@ -2139,6 +2351,16 @@ function apply(ctx, config) {
   const settings = resolveSettings(config);
   const service = new RemoteInstanceService(ctx, settings);
   ctx.effect(() => () => service.dispose(), "remote-instance.dispose");
+  if (settings.bridgePort > 0) {
+    void startBridge(
+      { get: (name2) => ctx.get?.(name2), ...ctx.logger === void 0 ? {} : { logger: ctx.logger } },
+      { port: settings.bridgePort, tokenFile: settings.bridgeTokenFile, dshHome: dirname5(settings.storeFile) }
+    ).then((bridge) => {
+      ctx.effect(() => () => bridge.close(), "remote-instance.bridge");
+    }, (error) => {
+      ctx.logger?.warn(`remote-instance bridge failed to start: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
   ctx.effect(() => ctx.jobs.attachController("remote-instance"), "remote-instance.jobs");
   const originOf = () => {
     try {
@@ -2227,6 +2449,7 @@ export {
   secretsPathFor,
   shellQuote,
   sshArgv,
+  startBridge,
   taskCommand,
   validateInstance,
   validateRequest,

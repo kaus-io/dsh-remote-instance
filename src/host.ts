@@ -3,12 +3,15 @@
  * Host entry: resolve config, mount the remote instance service, and register
  * the Settings-panel endpoints plus the `remote_instance` tool.
  */
+import { startBridge } from './bridge.js'
 import { ACTION_PATH, createActionHandler, createObserveHandler, OBSERVE_PATH } from './http.js'
 import { resolveSettings } from './settings.js'
+import { dirname } from 'node:path'
 import { RemoteInstanceService } from './service.js'
 import { parameters, READ_ACTIONS, TOOL_DESCRIPTION } from './tool.js'
 import type { HostContext } from './contracts.js'
 
+export { startBridge } from './bridge.js'
 export { AcpClient, AcpConnectionError } from './acp.js'
 export { decompressFrames, historyCommand, parseSessionLog, MAX_LOG_BYTES } from './history.js'
 export { createTaskParser } from './headless.js'
@@ -40,6 +43,16 @@ export function apply(ctx: HostContext, config?: unknown): void {
   const service = new RemoteInstanceService(ctx, settings)
 
   ctx.effect(() => () => service.dispose(), 'remote-instance.dispose')
+  if (settings.bridgePort > 0) {
+    void startBridge(
+      { get: name => ctx.get?.(name), ...(ctx.logger === undefined ? {} : { logger: ctx.logger }) },
+      { port: settings.bridgePort, tokenFile: settings.bridgeTokenFile, dshHome: dirname(settings.storeFile) },
+    ).then(bridge => {
+      ctx.effect(() => () => bridge.close(), 'remote-instance.bridge')
+    }, error => {
+      ctx.logger?.warn(`remote-instance bridge failed to start: ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
   ctx.effect(() => ctx.jobs.attachController('remote-instance'), 'remote-instance.jobs')
 
   const originOf = () => {

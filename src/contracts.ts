@@ -207,6 +207,8 @@ export interface HostContext {
   readonly webServer: WebServer
   readonly connection: ConnectionService
   readonly logger?: Logger
+  /** 按名字取一个可选 Host 服务（桥接读 sessionController）。 / Look up an optional Host service by name. */
+  get?(name: string): unknown
   effect(factory: () => (() => void) | void, label?: string): void
   on(event: 'agent/disposed', listener: (payload: { readonly agent: AgentLike }) => void): () => void
 }

@@ -5,7 +5,7 @@
  * `$DSH_HOME`.
  */
 import { homedir } from 'node:os'
-import { isAbsolute, join, normalize, sep } from 'node:path'
+import { dirname, isAbsolute, join, normalize, sep } from 'node:path'
 import { validateInstance } from './instances.js'
 
 /** 插件全部可调值，`apply` 时解析一次。 / Every tunable the plugin resolves once in `apply`. */
@@ -22,6 +22,10 @@ export interface ServiceSettings {
   readonly maxOutputBytes: number
   /** 清单文件不存在时写入的首轮设备；默认空。 / Devices seeded when the list file is absent; empty by default. */
   readonly seed: readonly unknown[]
+  /** 桥接监听端口；0 表示关闭。 / Bridge listen port; 0 disables it. */
+  readonly bridgePort: number
+  /** 桥接 token 文件；默认与清单同目录。 / Bridge token file; beside the list by default. */
+  readonly bridgeTokenFile: string
 }
 
 const LIMITS = {
@@ -29,9 +33,10 @@ const LIMITS = {
   probeTimeoutMs: [1_000, 300_000, 30_000],
   taskTimeoutMs: [10_000, 86_400_000, 3_600_000],
   maxOutputBytes: [4_096, 4_194_304, 262_144],
+  bridgePort: [0, 65_535, 0],
 } as const satisfies Record<string, readonly [number, number, number]>
 
-const KNOWN_KEYS = new Set<string>(['storeFile', ...Object.keys(LIMITS), 'instances'])
+const KNOWN_KEYS = new Set<string>(['storeFile', 'bridgeTokenFile', ...Object.keys(LIMITS), 'instances'])
 
 /** 展开只针对当前用户 home 的 `~` 前缀；其它形式原样返回。 / Expand a bare or current-user `~`; everything else passes through. */
 export function expandHome(value: string): string {
@@ -66,6 +71,18 @@ function readInteger(source: Record<string, unknown>, key: keyof typeof LIMITS):
     throw new Error(`remote-instance config: ${key} must be an integer in [${minimum}, ${maximum}]`)
   }
   return value as number
+}
+
+/** token 文件默认落在清单同目录。 / The token file defaults beside the device list. */
+function readBridgeTokenFile(source: Record<string, unknown>, storeFile: string): string {
+  const value = source.bridgeTokenFile
+  if (value === undefined) return join(dirname(storeFile), 'remote-instance-bridge-token')
+  if (typeof value !== 'string' || !value.trim() || value.length > 4096 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error('remote-instance config: bridgeTokenFile must be a non-empty path')
+  }
+  const expanded = expandHome(value.trim())
+  if (!isAbsolute(expanded)) throw new Error('remote-instance config: bridgeTokenFile must be absolute or start with ~')
+  return normalize(expanded)
 }
 
 function readStoreFile(source: Record<string, unknown>): string {
@@ -103,5 +120,7 @@ export function resolveSettings(config: unknown): ServiceSettings {
     taskTimeoutMs: readInteger(source, 'taskTimeoutMs'),
     maxOutputBytes: readInteger(source, 'maxOutputBytes'),
     seed: seed === undefined ? [] : (seed as readonly unknown[]),
+    bridgePort: readInteger(source, 'bridgePort'),
+    bridgeTokenFile: readBridgeTokenFile(source, readStoreFile(source)),
   }
 }
