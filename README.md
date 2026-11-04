@@ -87,6 +87,22 @@ pnpm add link:/home/zxhhyj/AndroidStudioProjects/kaus-workspace/projects/dsh-rem
 
 然后把 `@kaus-io/dsh-remote-instance` 追加到该 `package.json` 的 `dsh.profile.bundles`。`patchReload: startup` 的 profile 需要重启 `dsh web` 才会加载新 bundle。
 
+## 发布
+
+包名属于 npm 组织 `kaus-io`：`@kaus-io/dsh-remote-instance`。发布前：
+
+```sh
+pnpm run typecheck && node scripts/build.mjs --check && pnpm test
+npm pack --dry-run                # 核对 tarball：index.js、client.js、cordis.patch.yml、locale、icon 必须在
+npm publish                       # scoped 包已声明 publishConfig.access=public，无需再加 --access
+```
+
+- 兼容范围在 `engines.dsh`（当前 `>=0.2.1-rc.5 <0.3.0`）：安装器在 pnpm 之前就检查。DSH 升到 0.3 之前必须同步改，否则新装会被拒；旧版本用户也装不上。
+- `repository` / `homepage` 故意留空（不编造地址）；确定仓库 URL 后补上，npm 页面才会显示来源。
+- 发布后用户的装法：`dsh plugin --profile web add @kaus-io/dsh-remote-instance`，或 Plugins → Add plugin 填 `@kaus-io/dsh-remote-instance@1.0.0`；本地 `link:` 与 npm 安装互斥，换装前先卸掉旧源。
+- 想出现在 Discover：托管一份插件市场索引 JSON（format 1，用 `@deepseek-ai/dsh-plugin-market-index` 校验），在其中列 `name@version` 和可选 `registry`，用户把索引 URL 加到 Discover。
+- 刚发布的版本可能被 pnpm 的 `minimumReleaseAge` 供应链策略暂时挡住，装到的可能不是最新版。
+
 ## 源码与构建
 
 | 源码 | 产物 | 说明 |
