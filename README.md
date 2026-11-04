@@ -20,7 +20,7 @@
 ### 安装
 
 ```sh
-dsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha01
+dsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha02
 ```
 
 本地开发用 `link:` 指向仓库目录，两种来源互斥；`patchReload: startup` 的 profile 需要重启 `dsh web` 才会加载新 bundle。
