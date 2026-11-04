@@ -38,9 +38,11 @@ describe('validateInstance', () => {
   })
 
   it('rejects names that would be confusing or unsafe', () => {
-    for (const name of ['Laptop', '1laptop', '-laptop', 'laptop name', 'a'.repeat(33), '']) {
+    for (const name of ['Laptop', '-laptop', 'laptop name', 'a'.repeat(33), '']) {
       assert.throws(() => validateInstance({ name, host: 'h' }), /name/)
     }
+    // 以 IP 派生的名字可以以数字开头。 / A name derived from an IP may start with a digit.
+    assert.equal(validateInstance({ name: '100-68-98-76', host: '100.68.98.76' }).name, '100-68-98-76')
   })
 
   it('rejects hosts that look like ssh options', () => {

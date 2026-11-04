@@ -19,7 +19,7 @@ const FIELDS: Record<string, { readonly type: 'string' | 'integer' | 'boolean'; 
     enum: ACTIONS,
     description: 'instances lists registered devices with their last probe; add/remove edit the device list; probe checks ssh reachability, remote dsh version, and the profile directory; ask dispatches a task to the remote DSH agent as a background job; jobs lists this session’s remote jobs; status/cancel use a jobId.',
   },
-  name: { type: 'string', description: 'Registered device name from instances, e.g. laptop. Required by add/remove/probe/ask; `add` creates or replaces it.' },
+  name: { type: 'string', description: 'Device name from instances, e.g. laptop. Required by remove/probe/ask; `add` creates or replaces it and derives a name from the host when omitted.' },
   host: { type: 'string', description: 'For add: remote host name, IP address, or ssh config alias. Never a URL.' },
   user: { type: 'string', description: 'For add: ssh login name. Omit to let ssh config decide.' },
   port: { type: 'integer', description: 'For add: ssh port, 1-65535. Omit for the ssh default.' },
@@ -30,6 +30,7 @@ const FIELDS: Record<string, { readonly type: 'string' | 'integer' | 'boolean'; 
   shell: { type: 'string', description: 'For add: login shell that wraps the remote command, default bash; an empty string runs it directly.' },
   cwd: { type: 'string', description: 'For add: remote working directory for dispatched tasks. Default is the ssh login directory.' },
   note: { type: 'string', description: 'For add: short human note shown in the Settings panel.' },
+  password: { type: 'string', description: 'For add: the ssh password for this device. Stored in a 0600 file beside the device list and never returned; prefer the Settings panel, because a tool argument is recorded in the conversation log.' },
   prompt: { type: 'string', description: 'For ask: the task text handed to the remote DSH agent. It travels over stdin, never inside a shell command line.' },
   sessionId: { type: 'string', description: 'For ask: continue an existing remote dsh session id instead of starting a fresh one.' },
   jobId: { type: 'string', description: 'For status/cancel: the jobId returned by ask or listed by jobs.' },
@@ -49,10 +50,10 @@ export const parameters = {
 
 export const TOOL_DESCRIPTION = [
   'Connect to other devices’ DSH instances over SSH and dispatch work to them.',
-  'Each registered instance is a device running dsh; ask hands one prompt to that device’s DSH agent (dsh --profile <profile> --json) and streams its progress as an ordinary background job, so several instances and several tasks can run in parallel.',
+  'Each registered instance is a device running dsh on Linux, macOS, or Windows; ask hands one prompt to that device’s DSH agent (dsh --profile <profile> --json) and streams its progress as an ordinary background job, so several instances and several tasks can run in parallel.',
   'instances lists devices, add/remove edit the list, probe checks ssh reachability plus remote dsh version and profile directory, ask starts a job, and jobs/status/cancel track or stop that job.',
   'The prompt is piped over stdin, so no task text reaches a remote shell command line. add/remove/ask are native operations and need Full Access or a one-shot user approval; read-only actions do not.',
-  'SSH authentication must be non-interactive: keys or an ssh-agent, never a password. A first connection to an unknown host key fails until `ssh <host>` has been accepted manually.',
+  'Authentication is either a password (stored in a 0600 file beside the list, answered by SSH_ASKPASS, never placed in argv or a log) or a key from ssh config or an ssh-agent. A first-seen host key is accepted on the first connection and pinned; a changed key still fails.',
 ].join(' ')
 
 /**

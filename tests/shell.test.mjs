@@ -94,11 +94,13 @@ describe('probe output parsing', () => {
 
 describe('real shell execution', { skip: hasBash ? false : 'bash is unavailable' }, () => {
   it('runs the probe script and yields parseable facts', async () => {
-    const command = remoteProbeCommand({ host: 'h', profile: 'headless', dsh: 'node', shell: 'bash' })
+    // 用一定不存在的 profile，避免本机恰好装过 headless 时误判。 / Use a profile that cannot exist locally.
+    const command = remoteProbeCommand({ host: 'h', profile: 'nope-ri-test', dsh: 'node', shell: 'bash' })
     const stdout = execFileSync('bash', ['-c', command], { encoding: 'utf8' })
     const facts = parseProbeOutput(stdout)
     assert.match(facts.version ?? '', /^v\d+\./)
     assert.equal(facts.profile, 'missing')
+    assert.equal(facts.platform, 'posix')
     assert.ok(facts.cwd)
   })
 

@@ -40,6 +40,8 @@ interface InstanceView {
   readonly profile: string
   readonly dsh: string
   readonly shell: string
+  readonly auth?: 'password' | 'key'
+  readonly platform?: 'posix' | 'windows'
   readonly cwd?: string
   readonly note?: string
   readonly lastProbe?: ProbeView
@@ -58,10 +60,11 @@ interface Draft {
   readonly proxyJump: string
   readonly dsh: string
   readonly shell: string
+  readonly password: string
 }
 
 const EMPTY_DRAFT: Draft = {
-  name: '', host: '', user: '', port: '', profile: 'headless', cwd: '', note: '', identityFile: '', proxyJump: '', dsh: 'dsh', shell: 'bash',
+  name: '', host: '', user: '', port: '', profile: 'headless', cwd: '', note: '', identityFile: '', proxyJump: '', dsh: 'dsh', shell: 'bash', password: '',
 }
 
 /** 面板从 `inject` 拿到的 Host 访问方式。 / Host access handed to the panel through `inject`. */
@@ -104,12 +107,16 @@ const ZH: Record<string, string> = {
   fieldProfile: '远程 profile',
   fieldCwd: '工作目录',
   fieldNote: '备注',
+  fieldPassword: '密码',
+  hintPassword: '用于 ssh 密码登录；留空表示沿用已保存的密码，新设备留空则改用密钥',
+  authPassword: '密码',
+  authKey: '密钥',
   advanced: '高级',
   fieldIdentity: '私钥路径',
   fieldJump: '跳板机（-J）',
   fieldDsh: 'dsh 可执行文件',
   fieldShell: '登录 shell',
-  hintName: '小写字母开头，允许 a-z、0-9、- 和 _',
+  hintName: '留空则按 IP 自动生成；允许 a-z、0-9、- 和 _',
   hintHost: '主机名、IP，或 ~/.ssh/config 里的别名',
   hintPort: '留空使用 ssh 默认端口',
   hintProfile: '远端须已存在该 profile，默认 headless',
@@ -156,12 +163,16 @@ const EN: Record<string, string> = {
   fieldProfile: 'Remote profile',
   fieldCwd: 'Working directory',
   fieldNote: 'Note',
+  fieldPassword: 'Password',
+  hintPassword: 'Used for ssh password login; blank keeps a saved password, and a new device with no password falls back to a key',
+  authPassword: 'password',
+  authKey: 'key',
   advanced: 'Advanced',
   fieldIdentity: 'Identity file',
   fieldJump: 'Jump host (-J)',
   fieldDsh: 'dsh executable',
   fieldShell: 'Login shell',
-  hintName: 'Start with a lowercase letter; a-z, 0-9, - and _ only',
+  hintName: 'Blank derives a name from the IP; a-z, 0-9, - and _ only',
   hintHost: 'Host name, IP address, or an ssh config alias',
   hintPort: 'Blank uses the ssh default port',
   hintProfile: 'That profile must exist remotely; headless by default',
@@ -278,6 +289,8 @@ function asInstances(value: unknown): { store: string; instances: InstanceView[]
       profile: textOf(row.profile) ?? 'headless',
       dsh: textOf(row.dsh) ?? 'dsh',
       shell: textOf(row.shell) ?? 'bash',
+      auth: row.auth === 'password' ? 'password' : row.auth === 'key' ? 'key' : undefined,
+      platform: row.platform === 'windows' ? 'windows' : row.platform === 'posix' ? 'posix' : undefined,
       cwd: textOf(row.cwd),
       note: textOf(row.note),
       lastProbe: probeOf(row.lastProbe),
@@ -304,11 +317,10 @@ async function postJson(path: string, header: Record<string, string>, body: unkn
 }
 
 function draftToArgs(draft: Draft, t: Translate): Record<string, unknown> {
-  const name = draft.name.trim()
-  if (!name) throw new Error(t('nameRequired'))
   const host = draft.host.trim()
   if (!host) throw new Error(t('hostRequired'))
-  const args: Record<string, unknown> = { action: 'add', name, host }
+  const name = draft.name.trim()
+  const args: Record<string, unknown> = { action: 'add', host, ...(name ? { name } : {}) }
   for (const key of ['user', 'cwd', 'note', 'identityFile', 'proxyJump'] as const) {
     const value = draft[key].trim()
     if (value) args[key] = value
@@ -318,6 +330,7 @@ function draftToArgs(draft: Draft, t: Translate): Record<string, unknown> {
   const dsh = draft.dsh.trim()
   if (dsh) args.dsh = dsh
   args.shell = draft.shell.trim()
+  if (draft.password) args.password = draft.password
   if (draft.port.trim()) {
     const port = Number(draft.port.trim())
     if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error(t('invalidPort'))
@@ -378,6 +391,8 @@ function InstanceRow(props: {
           <span className="ri-name">{instance.name}</span>
           <span className="ri-target">{instance.target}</span>
           <span className="ri-tag">{t('profileTag')} {instance.profile}</span>
+          <span className="ri-tag">{instance.auth === 'password' ? t('authPassword') : t('authKey')}</span>
+          {instance.platform ? <span className="ri-tag">{instance.platform}</span> : null}
           {instance.cwd ? <span className="ri-muted">{instance.cwd}</span> : null}
         </div>
         {instance.note ? <span className="ri-muted">{instance.note}</span> : null}
@@ -561,6 +576,7 @@ function RemoteInstancesSection({ t, api }: SectionProps): ReactElement {
           <Field id={`${fieldId}-profile`} label={t('fieldProfile')} value={draft.profile} hint={t('hintProfile')} onChange={update('profile')} />
           <Field id={`${fieldId}-cwd`} label={t('fieldCwd')} value={draft.cwd} hint={t('hintCwd')} onChange={update('cwd')} />
           <Field id={`${fieldId}-note`} label={t('fieldNote')} value={draft.note} onChange={update('note')} />
+          <Field id={`${fieldId}-password`} label={t('fieldPassword')} value={draft.password} hint={t('hintPassword')} type="password" onChange={update('password')} />
         </div>
         <details className="ri-advanced">
           <summary>{t('advanced')}</summary>

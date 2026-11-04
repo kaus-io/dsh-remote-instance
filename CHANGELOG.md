@@ -1,5 +1,13 @@
 # 更新日志
 
+## 1.0.0-alpha03
+
+- 新增密码认证：`add` 接受 `password`，保存到 `$DSH_HOME/remote-instances.secrets.json`（`0600`），只经 `SSH_ASKPASS` 交给 ssh 子进程，绝不进 `argv`、日志、作业输出或工具结果。
+- 远端平台支持：POSIX（Linux/macOS）与 Windows（PowerShell，命令用 base64 编码避免引号歧义）；`probe` 自动识别并记住平台，之后的 `ask` 按平台拼命令。
+- 登记只需账号、IP、密码：省略名字时按 IP 派生（`100.68.98.76` → `100-68-98-76`）。
+- 首次连接接受并锁定主机指纹（`accept-new`），指纹变化仍然失败。
+- 密码认证要求运行 DSH 的机器有 POSIX `ssh` 客户端；Windows 宿主请用密钥。
+
 ## 1.0.0-alpha02
 
 首个发布到 npm 的版本（alpha01 只用于打 tag，未发布）。

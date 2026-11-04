@@ -5,9 +5,11 @@
 ## 远端命令与传输
 
 - 任务正文（prompt）**只能走 ssh 的 stdin**。任何把用户文本拼进远端命令行、`--session-id` 之外的参数、环境变量或文件名里的做法都视为注入缺陷。
-- 远端命令只由固定片段拼装，值一律经 `shellQuote`（POSIX 单引号）转义：`ssh ... -T -o BatchMode=yes ... -- <host> '<login shell>' -lc '<cd + exec dsh ...>'`。`host`/`user`/`identityFile`/`proxyJump`/`port` 由 `validateInstance` 的字符白名单先筛，`sessionId` 只允许 `A-Za-z0-9_-`。
+- 远端命令只由固定片段拼装，按平台二选一：POSIX 走 `shellQuote`（单引号）+ 登录 shell；Windows 只走 `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand <UTF-16LE base64>`，禁止在 cmd/PowerShell 里拼引号。`host`/`user`/`identityFile`/`proxyJump`/`port` 先过白名单，`sessionId` 只允许 `A-Za-z0-9_-`。
+- 平台由 `probe` 识别并缓存（`platform: posix|windows`）：先按已知平台探测，拿不到 `dsh` 版本再换另一边；`ask` 按缓存的平台拼命令。
 - 不新增任意远端 shell、sudo、文件上传下载、端口转发、`ProxyCommand` 或 `-o` 透传参数；`probe` 的脚本内容固定，只读。
-- SSH 必须保持免交互：`BatchMode=yes` 加上建连/保活/总超时。不改写 `known_hosts` 策略，首次连接未知指纹就是失败，让用户手动接受。
+- 认证两种：密钥模式 `BatchMode=yes`；密码模式 `BatchMode=no` + `PreferredAuthentications=password,keyboard-interactive` + `NumberOfPasswordPrompts=1`，密码只经 `SSH_ASKPASS` 从子进程环境读取（`askpassEnv` + `DSH_REMOTE_PASSWORD`），绝不进 argv/日志/结果。
+- 两种模式都用 `StrictHostKeyChecking=accept-new`：首次接受并锁定指纹，指纹变化仍然失败；`-o LogLevel=ERROR` 只用来压掉 ssh 自身的噪声警告。
 - 所有进程经 `ctx.subprocess` 托管，`createRunner` 负责取消、超时与等待整棵进程树退出；不要直接 `child_process`。
 
 ## 权限与清单
@@ -15,6 +17,8 @@
 - `add`/`remove`/`ask` 是原生操作：Full Access 会话放行，否则必须 `ctx.approval.request` 得到 `allowed-once`；`ui` 来源来自用户本人点击，不得再弹审批，也不得把审批结果当成模型可伪造的参数。
 - 设备清单写在 `$DSH_HOME`（默认 `~/.dsh`）的 `remote-instances.json`，权限 `0600`，写入串行化并走「临时文件 + rename」。不从其它仓库或用户目录借用路径。
 - 清单损坏要报错而不是静默清空；单行不合法只跳过并报告。字段校验只有 `src/instances.ts` 一份，工具、界面、配置文件种子共用。
+- 密码存 `$DSH_HOME/remote-instances.secrets.json`（`0600`，与清单分离，`SecretStore`）；不得进入清单、工具结果、HTTP 响应、作业输出、日志或 argv，`remove` 必须同时删密码。工具参数里的 `password` 会被会话日志记录，文档提醒优先用设置面板。
+- 密码认证要求运行 DSH 的机器是 Linux/macOS（Windows 宿主没有可用的 `SSH_ASKPASS`），界面与工具都要给出可读的失败原因。
 - 作业 owner 必须是触发会话：`jobs`/`status`/`cancel` 一律带 `agent.id` 校验，跨会话 id 视为未知；`dispose` 要终止在跑进程并等待退出。
 
 ## 客户端

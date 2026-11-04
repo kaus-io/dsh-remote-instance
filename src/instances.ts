@@ -7,7 +7,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 /** 实例名：小写开头，允许 `-`/`_`，最长 32。 / Instance name: lowercase start, `-`/`_` allowed, max 32. */
-export const NAME_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/
+export const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/
 /** 远程路径/可执行文件可接受的字符；不允许空白以外的控制字符。 / Characters accepted for remote paths and executables. */
 const PLAIN_TEXT = /[\u0000-\u001f\u007f]/
 const HOST_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/
@@ -39,6 +39,10 @@ export interface RemoteInstance {
   readonly dsh: string
   /** 登录 shell 名；空串表示直接执行，不套 `-lc`。 / Login shell name; an empty string runs the command directly. */
   readonly shell: string
+  /** 认证方式；缺省视为密钥。 / Authentication; absent means key. */
+  readonly auth?: 'password' | 'key'
+  /** 已探知的远端平台。 / Detected remote platform. */
+  readonly platform?: 'posix' | 'windows'
   readonly cwd?: string
   readonly note?: string
   readonly createdAt: number
@@ -58,6 +62,10 @@ export interface InstanceSummary {
   readonly profile: string
   readonly dsh: string
   readonly shell: string
+  /** 认证方式；缺省视为密钥。 / Authentication; absent means key. */
+  readonly auth?: 'password' | 'key'
+  /** 已探知的远端平台。 / Detected remote platform. */
+  readonly platform?: 'posix' | 'windows'
   readonly cwd?: string
   readonly note?: string
   readonly createdAt: number
@@ -105,6 +113,10 @@ export function validateInstance(input: unknown, options: { readonly now?: numbe
   const profile = source.profile === undefined || source.profile === null || source.profile === '' ? 'headless' : assertString(source.profile, 'profile', PROFILE_PATTERN, 'use a lowercase dsh profile name such as headless or sdk')
   const proxyJump = optionalString(source.proxyJump, 'proxyJump', JUMP_PATTERN, 'use [user@]host[:port]')
   const cwd = optionalString(source.cwd, 'cwd', ABSOLUTE_REMOTE, 'use an absolute path or a ~/ path')
+  const auth = source.auth === undefined || source.auth === null || source.auth === '' ? undefined : source.auth
+  if (auth !== undefined && auth !== 'password' && auth !== 'key') throw new Error("auth must be 'password' or 'key'")
+  const platform = source.platform === undefined || source.platform === null || source.platform === '' ? undefined : source.platform
+  if (platform !== undefined && platform !== 'posix' && platform !== 'windows') throw new Error("platform must be 'posix' or 'windows'")
   let note: string | undefined
   if (source.note !== undefined && source.note !== null && source.note !== '') {
     if (typeof source.note !== 'string' || source.note.length > MAX_NOTE || PLAIN_TEXT.test(source.note)) throw new Error('note must be a short string without control characters')
@@ -120,6 +132,8 @@ export function validateInstance(input: unknown, options: { readonly now?: numbe
     profile,
     dsh,
     shell,
+    ...(auth === undefined ? {} : { auth }),
+    ...(platform === undefined ? {} : { platform }),
     ...(cwd === undefined ? {} : { cwd }),
     ...(note === undefined ? {} : { note }),
     createdAt: options.existing?.createdAt ?? now,
@@ -142,6 +156,8 @@ export function instanceSummary(instance: RemoteInstance): InstanceSummary {
     profile: instance.profile,
     dsh: instance.dsh,
     shell: instance.shell,
+    ...(instance.auth === undefined ? {} : { auth: instance.auth }),
+    ...(instance.platform === undefined ? {} : { platform: instance.platform }),
     ...(instance.cwd === undefined ? {} : { cwd: instance.cwd }),
     ...(instance.note === undefined ? {} : { note: instance.note }),
     createdAt: instance.createdAt,

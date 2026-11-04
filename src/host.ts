@@ -15,7 +15,10 @@ export { InstanceStore, instanceSummary, displayTarget, NAME_PATTERN, restoreIns
 export { createRunner } from './runner.js'
 export { RemoteInstanceService } from './service.js'
 export { displayPath, resolveDshHome, resolveSettings } from './settings.js'
-export { parseProbeOutput, remoteProbeCommand, remoteTaskCommand, shellQuote, sshArgv } from './shell.js'
+export { askpassEnv, ASKPASS_SCRIPT, parseProbeOutput, shellQuote, sshArgv } from './shell.js'
+export { encodePowerShell, posixProbeCommand, posixTaskCommand, powershellCommand, probeCommand, psQuote, taskCommand, windowsProbeCommand, windowsTaskCommand } from './platform.js'
+export { posixProbeCommand as remoteProbeCommand, posixTaskCommand as remoteTaskCommand } from './platform.js'
+export { assertSecret, SecretStore, secretsPathFor } from './secrets.js'
 export { ACTIONS, READ_ACTIONS, TOOL_DESCRIPTION, validateRequest } from './tool.js'
 
 /** 插件身份。 / Plugin identity. */

@@ -146,7 +146,7 @@ import { isAbsolute, join, normalize, sep } from "node:path";
 // src/instances.ts
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-var NAME_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+var NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 var PLAIN_TEXT = /[\u0000-\u001f\u007f]/;
 var HOST_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/;
 var USER_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/;
@@ -187,6 +187,10 @@ function validateInstance(input, options = {}) {
   const profile = source.profile === void 0 || source.profile === null || source.profile === "" ? "headless" : assertString(source.profile, "profile", PROFILE_PATTERN, "use a lowercase dsh profile name such as headless or sdk");
   const proxyJump = optionalString(source.proxyJump, "proxyJump", JUMP_PATTERN, "use [user@]host[:port]");
   const cwd = optionalString(source.cwd, "cwd", ABSOLUTE_REMOTE, "use an absolute path or a ~/ path");
+  const auth = source.auth === void 0 || source.auth === null || source.auth === "" ? void 0 : source.auth;
+  if (auth !== void 0 && auth !== "password" && auth !== "key") throw new Error("auth must be 'password' or 'key'");
+  const platform = source.platform === void 0 || source.platform === null || source.platform === "" ? void 0 : source.platform;
+  if (platform !== void 0 && platform !== "posix" && platform !== "windows") throw new Error("platform must be 'posix' or 'windows'");
   let note;
   if (source.note !== void 0 && source.note !== null && source.note !== "") {
     if (typeof source.note !== "string" || source.note.length > MAX_NOTE || PLAIN_TEXT.test(source.note)) throw new Error("note must be a short string without control characters");
@@ -202,6 +206,8 @@ function validateInstance(input, options = {}) {
     profile,
     dsh,
     shell,
+    ...auth === void 0 ? {} : { auth },
+    ...platform === void 0 ? {} : { platform },
     ...cwd === void 0 ? {} : { cwd },
     ...note === void 0 ? {} : { note },
     createdAt: options.existing?.createdAt ?? now,
@@ -222,6 +228,8 @@ function instanceSummary(instance) {
     profile: instance.profile,
     dsh: instance.dsh,
     shell: instance.shell,
+    ...instance.auth === void 0 ? {} : { auth: instance.auth },
+    ...instance.platform === void 0 ? {} : { platform: instance.platform },
     ...instance.cwd === void 0 ? {} : { cwd: instance.cwd },
     ...instance.note === void 0 ? {} : { note: instance.note },
     createdAt: instance.createdAt,
@@ -399,6 +407,11 @@ function resolveSettings(config) {
   };
 }
 
+// src/service.ts
+import { chmod as chmod2, mkdtemp, rm, writeFile as writeFile3 } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as join2 } from "node:path";
+
 // src/headless.ts
 var MAX_ANSWER = 2e5;
 var MAX_RAW = 1e6;
@@ -515,13 +528,188 @@ ${errorText}
   };
 }
 
+// src/shell.ts
+var CONTROL = /[\u0000-\u001f\u007f]/;
+function assertPlain(value, label) {
+  if (typeof value !== "string" || CONTROL.test(value)) throw new Error(`${label} must be a string without control characters`);
+  return value;
+}
+function shellQuote(value) {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error("value must be a string without NUL characters");
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+function sshTargetOf(instance) {
+  return {
+    host: instance.host,
+    ...instance.user === void 0 ? {} : { user: instance.user },
+    ...instance.port === void 0 ? {} : { port: instance.port },
+    ...instance.identityFile === void 0 ? {} : { identityFile: instance.identityFile },
+    ...instance.proxyJump === void 0 ? {} : { proxyJump: instance.proxyJump }
+  };
+}
+function sshArgv(target, remoteCommand, options) {
+  if (typeof remoteCommand !== "string" || remoteCommand.includes("\0")) throw new Error("remote command must be a string without NUL characters");
+  if (!target.host) throw new Error("host is required");
+  if (target.host.startsWith("-")) throw new Error("host must not start with -");
+  const auth = options.auth ?? "key";
+  const argv = [
+    "ssh",
+    "-T",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    `ConnectTimeout=${Math.max(1, Math.ceil(options.connectTimeoutMs / 1e3))}`,
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4"
+  ];
+  if (auth === "password") {
+    argv.push("-o", "BatchMode=no", "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "NumberOfPasswordPrompts=1");
+  } else {
+    argv.push("-o", "BatchMode=yes");
+  }
+  if (target.port !== void 0) argv.push("-p", String(target.port));
+  if (target.identityFile) argv.push("-i", assertPlain(target.identityFile, "identityFile"));
+  if (target.proxyJump) argv.push("-J", assertPlain(target.proxyJump, "proxyJump"));
+  if (target.user) argv.push("-l", assertPlain(target.user, "user"));
+  argv.push("--", target.host, remoteCommand);
+  return argv;
+}
+function parseProbeOutput(stdout) {
+  const facts = {};
+  for (const raw of stdout.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (!line.startsWith("probe	")) continue;
+    const [, key, ...rest] = line.split("	");
+    if (!key || rest.length === 0) continue;
+    const value = rest.join("	").trim();
+    if (value) facts[key] = value;
+  }
+  const platform = facts.platform === "windows" ? "windows" : facts.platform === "posix" ? "posix" : void 0;
+  return {
+    ...facts.version === void 0 ? {} : { version: facts.version },
+    ...facts.os === void 0 ? {} : { os: facts.os },
+    ...facts.path === void 0 ? {} : { dshPath: facts.path },
+    ...facts.home === void 0 ? {} : { dshHome: facts.home },
+    ...facts.cwd === void 0 ? {} : { cwd: facts.cwd },
+    ...facts.profile === void 0 ? {} : { profile: facts.profile },
+    ...platform === void 0 ? {} : { platform }
+  };
+}
+var ASKPASS_SCRIPT = `#!/bin/sh
+printf '%s\\n' "\${DSH_REMOTE_PASSWORD-}"
+`;
+function askpassEnv(helperPath) {
+  return {
+    SSH_ASKPASS: helperPath,
+    SSH_ASKPASS_REQUIRE: "force",
+    DISPLAY: ":0"
+  };
+}
+
+// src/platform.ts
+function psQuote(value) {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error("value must be a string without NUL characters");
+  return `'${value.replace(/'/g, "''")}'`;
+}
+function encodePowerShell(script) {
+  return Buffer.from(script, "utf16le").toString("base64");
+}
+function powershellCommand(script) {
+  return `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodePowerShell(script)}`;
+}
+function requireSessionId(sessionId) {
+  if (sessionId === void 0) return void 0;
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) throw new Error("sessionId may only contain A-Za-z0-9, _ and -");
+  return sessionId;
+}
+function posixTaskScript(instance, sessionId) {
+  const steps = [];
+  if (instance.cwd) steps.push(`cd -- ${shellQuote(instance.cwd)}`);
+  const argv = [instance.dsh, "--profile", instance.profile, "--json"];
+  const id = requireSessionId(sessionId);
+  if (id !== void 0) argv.push("--session-id", id);
+  steps.push(`exec ${argv.map((value) => shellQuote(value)).join(" ")}`);
+  return steps.join(" && ");
+}
+function posixTaskCommand(instance, sessionId) {
+  const script = posixTaskScript(instance, sessionId);
+  if (!instance.shell) return script;
+  return `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
+}
+function posixProbeScript(instance) {
+  const dsh = shellQuote(instance.dsh);
+  return [
+    'home="${DSH_HOME:-$HOME/.dsh}"',
+    `printf 'probe\\tversion\\t%s\\n' "$(${dsh} --version 2>&1 | head -n 1)"`,
+    `printf 'probe\\tos\\t%s\\n' "$(uname -srm 2>&1)"`,
+    `printf 'probe\\tpath\\t%s\\n' "$(command -v ${dsh} 2>/dev/null || printf missing)"`,
+    `printf 'probe\\thome\\t%s\\n' "$home"`,
+    `printf 'probe\\tcwd\\t%s\\n' "$(pwd)"`,
+    `printf 'probe\\tprofile\\t%s\\n' "$([ -f "$home/profiles/${instance.profile}/package.json" ] && printf present || printf missing)"`,
+    "printf 'probe\\tplatform\\tposix\\n'"
+  ].join("\n");
+}
+function posixProbeCommand(instance) {
+  const script = posixProbeScript(instance);
+  if (!instance.shell) return script;
+  return `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
+}
+function windowsProbeScript(instance) {
+  return [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
+    "$t = [char]9",
+    `$dsh = ${psQuote(instance.dsh)}`,
+    "if ($env:DSH_HOME) { $home = $env:DSH_HOME } else { $home = Join-Path $env:USERPROFILE '.dsh' }",
+    "$cmd = Get-Command $dsh | Select-Object -First 1",
+    `"probe\${t}version\${t}$(& $dsh --version 2>&1 | Select-Object -First 1)"`,
+    `"probe\${t}os\${t}$([Environment]::OSVersion.VersionString)"`,
+    `"probe\${t}path\${t}$(if ($cmd) { $cmd.Source } else { 'missing' })"`,
+    `"probe\${t}home\${t}$home"`,
+    `"probe\${t}cwd\${t}$((Get-Location).Path)"`,
+    `"probe\${t}profile\${t}$(if (Test-Path (Join-Path $home 'profiles/${instance.profile}/package.json')) { 'present' } else { 'missing' })"`,
+    `"probe\${t}platform\${t}windows"`
+  ].join("\n");
+}
+function windowsProbeCommand(instance) {
+  return powershellCommand(windowsProbeScript(instance));
+}
+function windowsTaskScript(instance, sessionId) {
+  const lines = [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8"
+  ];
+  if (instance.cwd) lines.push(`Set-Location -LiteralPath ${psQuote(instance.cwd)}`);
+  const args = [instance.dsh, "--profile", instance.profile, "--json"];
+  const id = requireSessionId(sessionId);
+  if (id !== void 0) args.push("--session-id", id);
+  lines.push(`& ${args.map(psQuote).join(" ")}`);
+  lines.push("if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }");
+  return lines.join("\n");
+}
+function windowsTaskCommand(instance, sessionId) {
+  return powershellCommand(windowsTaskScript(instance, sessionId));
+}
+function taskCommand(instance, platform, sessionId) {
+  return platform === "windows" ? windowsTaskCommand(instance, sessionId) : posixTaskCommand(instance, sessionId);
+}
+function probeCommand(instance, platform) {
+  return platform === "windows" ? windowsProbeCommand(instance) : posixProbeCommand(instance);
+}
+
 // src/runner.ts
 import { StringDecoder } from "node:string_decoder";
 function createRunner(subprocess, options = {}) {
   const active = options.active ?? /* @__PURE__ */ new Set();
   const maxOutput = Math.min(Math.max(options.maxOutput ?? 262144, 4096), 4194304);
   return async function run(argv, runOptions = {}) {
-    const { signal, stdin, timeoutMs = 12e4, onOutput } = runOptions;
+    const { signal, stdin, timeoutMs = 12e4, onOutput, env } = runOptions;
     signal?.throwIfAborted();
     if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string" || value.includes("\0"))) {
       throw new Error("Invalid process argv");
@@ -541,6 +729,7 @@ function createRunner(subprocess, options = {}) {
       const executable = await subprocess.resolveExecutable(argv[0], void 0, controller.signal);
       child = subprocess.spawn({
         argv: [executable, ...argv.slice(1)],
+        ...env === void 0 ? {} : { env },
         signal: controller.signal,
         graceMs: 3e3,
         stdio: { stdin: stdin === void 0 ? "ignore" : { data: stdin }, stdout: "pipe", stderr: "pipe" }
@@ -584,96 +773,81 @@ function createRunner(subprocess, options = {}) {
   };
 }
 
-// src/shell.ts
-var CONTROL = /[\u0000-\u001f\u007f]/;
-function assertPlain(value, label) {
-  if (typeof value !== "string" || CONTROL.test(value)) throw new Error(`${label} must be a string without control characters`);
+// src/secrets.ts
+import { chmod, mkdir as mkdir2, readFile as readFile2, rename as rename2, writeFile as writeFile2 } from "node:fs/promises";
+import { dirname as dirname2 } from "node:path";
+var MAX_SECRET = 4096;
+function secretsPathFor(storeFile) {
+  return storeFile.endsWith(".json") ? `${storeFile.slice(0, -5)}.secrets.json` : `${storeFile}.secrets.json`;
+}
+var SecretStore = class {
+  constructor(file) {
+    this.file = file;
+  }
+  file;
+  chain = Promise.resolve();
+  /** 读取全部密码；文件缺失视为空，结构损坏抛错。 / Read every password; a missing file is empty, a broken one throws. */
+  async load() {
+    let text;
+    try {
+      text = await readFile2(this.file, "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT") return /* @__PURE__ */ new Map();
+      throw new Error(`Cannot read the remote instance passwords: ${error.message}`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error("The remote instance password file is not valid JSON; fix or delete it before retrying");
+    }
+    if (!parsed || typeof parsed !== "object" || typeof parsed.passwords !== "object") {
+      throw new Error("The remote instance password file has no `passwords` object");
+    }
+    const result = /* @__PURE__ */ new Map();
+    for (const [name2, value] of Object.entries(parsed.passwords)) {
+      if (typeof value === "string" && value.length > 0 && value.length <= MAX_SECRET) result.set(name2, value);
+    }
+    return result;
+  }
+  /** 读一个密码。 / Read one password. */
+  async get(name2) {
+    return (await this.load()).get(name2);
+  }
+  /** 写入或替换一个密码。 / Store or replace one password. */
+  async set(name2, password) {
+    await this.serialize(async () => {
+      const passwords = await this.load();
+      passwords.set(name2, assertSecret(password));
+      await this.write(passwords);
+    });
+  }
+  /** 删除一个密码；不存在时忽略。 / Remove one password; a missing name is ignored. */
+  async delete(name2) {
+    await this.serialize(async () => {
+      const passwords = await this.load();
+      if (passwords.delete(name2)) await this.write(passwords);
+    });
+  }
+  async write(passwords) {
+    await mkdir2(dirname2(this.file), { recursive: true });
+    const temporary = `${this.file}.${process.pid}.tmp`;
+    const body = JSON.stringify({ version: 1, passwords: Object.fromEntries(passwords) }, null, 2) + "\n";
+    await writeFile2(temporary, body, { encoding: "utf8", mode: 384 });
+    await chmod(temporary, 384);
+    await rename2(temporary, this.file);
+  }
+  serialize(operation) {
+    const next = this.chain.then(operation, operation);
+    this.chain = next.catch(() => void 0);
+    return next;
+  }
+};
+function assertSecret(value) {
+  if (typeof value !== "string" || value.length === 0) throw new Error("password must be a non-empty string");
+  if (value.length > MAX_SECRET) throw new Error(`password is too long (max ${MAX_SECRET} characters)`);
+  if (value.includes("\0")) throw new Error("password must not contain NUL characters");
   return value;
-}
-function shellQuote(value) {
-  if (typeof value !== "string" || value.includes("\0")) throw new Error("value must be a string without NUL characters");
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-function sshTargetOf(instance) {
-  return {
-    host: instance.host,
-    ...instance.user === void 0 ? {} : { user: instance.user },
-    ...instance.port === void 0 ? {} : { port: instance.port },
-    ...instance.identityFile === void 0 ? {} : { identityFile: instance.identityFile },
-    ...instance.proxyJump === void 0 ? {} : { proxyJump: instance.proxyJump }
-  };
-}
-function sshArgv(target, remoteCommand, options) {
-  if (typeof remoteCommand !== "string" || remoteCommand.includes("\0")) throw new Error("remote command must be a string without NUL characters");
-  if (!target.host) throw new Error("host is required");
-  if (target.host.startsWith("-")) throw new Error("host must not start with -");
-  const argv = [
-    "ssh",
-    "-T",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    `ConnectTimeout=${Math.max(1, Math.ceil(options.connectTimeoutMs / 1e3))}`,
-    "-o",
-    "ServerAliveInterval=15",
-    "-o",
-    "ServerAliveCountMax=4"
-  ];
-  if (target.port !== void 0) argv.push("-p", String(target.port));
-  if (target.identityFile) argv.push("-i", assertPlain(target.identityFile, "identityFile"));
-  if (target.proxyJump) argv.push("-J", assertPlain(target.proxyJump, "proxyJump"));
-  if (target.user) argv.push("-l", assertPlain(target.user, "user"));
-  argv.push("--", target.host, remoteCommand);
-  return argv;
-}
-function wrapInShell(instance, script) {
-  if (instance.shell === "") return script;
-  return `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
-}
-function remoteTaskCommand(instance, sessionId) {
-  const steps = [];
-  if (instance.cwd) steps.push(`cd -- ${shellQuote(instance.cwd)}`);
-  const argv = [instance.dsh, "--profile", instance.profile, "--json"];
-  if (sessionId !== void 0) {
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) throw new Error("sessionId may only contain A-Za-z0-9, _ and -");
-    argv.push("--session-id", sessionId);
-  }
-  steps.push(`exec ${argv.map((value) => shellQuote(value)).join(" ")}`);
-  return wrapInShell(instance, steps.join(" && "));
-}
-function probeScript(instance) {
-  const dsh = shellQuote(instance.dsh);
-  return [
-    'home="${DSH_HOME:-$HOME/.dsh}"',
-    `printf 'probe\\tversion\\t%s\\n' "$(${dsh} --version 2>&1 | head -n 1)"`,
-    `printf 'probe\\tos\\t%s\\n' "$(uname -srm 2>&1)"`,
-    `printf 'probe\\tpath\\t%s\\n' "$(command -v ${dsh} 2>/dev/null || printf missing)"`,
-    `printf 'probe\\thome\\t%s\\n' "$home"`,
-    `printf 'probe\\tcwd\\t%s\\n' "$(pwd)"`,
-    `printf 'probe\\tprofile\\t%s\\n' "$([ -f "$home/profiles/${instance.profile}/package.json" ] && printf present || printf missing)"`
-  ].join("\n");
-}
-function remoteProbeCommand(instance) {
-  return wrapInShell(instance, probeScript(instance));
-}
-function parseProbeOutput(stdout) {
-  const facts = {};
-  for (const raw of stdout.split("\n")) {
-    const line = raw.replace(/\r$/, "");
-    if (!line.startsWith("probe	")) continue;
-    const [, key, ...rest] = line.split("	");
-    if (!key || rest.length === 0) continue;
-    const value = rest.join("	").trim();
-    if (value) facts[key] = value;
-  }
-  return {
-    ...facts.version === void 0 ? {} : { version: facts.version },
-    ...facts.os === void 0 ? {} : { os: facts.os },
-    ...facts.path === void 0 ? {} : { dshPath: facts.path },
-    ...facts.home === void 0 ? {} : { dshHome: facts.home },
-    ...facts.cwd === void 0 ? {} : { cwd: facts.cwd },
-    ...facts.profile === void 0 ? {} : { profile: facts.profile }
-  };
 }
 
 // src/tool.ts
@@ -686,7 +860,7 @@ var FIELDS = {
     enum: ACTIONS,
     description: "instances lists registered devices with their last probe; add/remove edit the device list; probe checks ssh reachability, remote dsh version, and the profile directory; ask dispatches a task to the remote DSH agent as a background job; jobs lists this session\u2019s remote jobs; status/cancel use a jobId."
   },
-  name: { type: "string", description: "Registered device name from instances, e.g. laptop. Required by add/remove/probe/ask; `add` creates or replaces it." },
+  name: { type: "string", description: "Device name from instances, e.g. laptop. Required by remove/probe/ask; `add` creates or replaces it and derives a name from the host when omitted." },
   host: { type: "string", description: "For add: remote host name, IP address, or ssh config alias. Never a URL." },
   user: { type: "string", description: "For add: ssh login name. Omit to let ssh config decide." },
   port: { type: "integer", description: "For add: ssh port, 1-65535. Omit for the ssh default." },
@@ -697,6 +871,7 @@ var FIELDS = {
   shell: { type: "string", description: "For add: login shell that wraps the remote command, default bash; an empty string runs it directly." },
   cwd: { type: "string", description: "For add: remote working directory for dispatched tasks. Default is the ssh login directory." },
   note: { type: "string", description: "For add: short human note shown in the Settings panel." },
+  password: { type: "string", description: "For add: the ssh password for this device. Stored in a 0600 file beside the device list and never returned; prefer the Settings panel, because a tool argument is recorded in the conversation log." },
   prompt: { type: "string", description: "For ask: the task text handed to the remote DSH agent. It travels over stdin, never inside a shell command line." },
   sessionId: { type: "string", description: "For ask: continue an existing remote dsh session id instead of starting a fresh one." },
   jobId: { type: "string", description: "For status/cancel: the jobId returned by ask or listed by jobs." },
@@ -714,10 +889,10 @@ var parameters = {
 };
 var TOOL_DESCRIPTION = [
   "Connect to other devices\u2019 DSH instances over SSH and dispatch work to them.",
-  "Each registered instance is a device running dsh; ask hands one prompt to that device\u2019s DSH agent (dsh --profile <profile> --json) and streams its progress as an ordinary background job, so several instances and several tasks can run in parallel.",
+  "Each registered instance is a device running dsh on Linux, macOS, or Windows; ask hands one prompt to that device\u2019s DSH agent (dsh --profile <profile> --json) and streams its progress as an ordinary background job, so several instances and several tasks can run in parallel.",
   "instances lists devices, add/remove edit the list, probe checks ssh reachability plus remote dsh version and profile directory, ask starts a job, and jobs/status/cancel track or stop that job.",
   "The prompt is piped over stdin, so no task text reaches a remote shell command line. add/remove/ask are native operations and need Full Access or a one-shot user approval; read-only actions do not.",
-  "SSH authentication must be non-interactive: keys or an ssh-agent, never a password. A first connection to an unknown host key fails until `ssh <host>` has been accepted manually."
+  "Authentication is either a password (stored in a 0600 file beside the list, answered by SSH_ASKPASS, never placed in argv or a log) or a key from ssh config or an ssh-agent. A first-seen host key is accepted on the first connection and pinned; a changed key still fails."
 ].join(" ");
 function validateRequest(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("A remote instance request must be an object");
@@ -751,6 +926,10 @@ function requireString(value, field) {
   if (typeof value !== "string" || !value) throw new Error(`${field} is required`);
   return value;
 }
+function deriveInstanceName(host) {
+  const base = host.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+  return base || "remote";
+}
 function firstLine(text) {
   return (text.split("\n").find((line) => line.trim()) ?? "").replace(/\s+/g, " ").trim();
 }
@@ -771,11 +950,16 @@ function tailChunks(chunks, budget) {
   if (truncated) kept.unshift({ at: kept[0]?.at ?? 0, text: "\u2026[earlier output omitted]\n" });
   return { chunks: kept, truncated };
 }
+function probeUsable(facts) {
+  const version = facts?.version;
+  return typeof version === "string" && version.length > 0 && version !== "missing" && !/not found|not recognized|CommandNotFound/i.test(version);
+}
 var RemoteInstanceService = class {
   constructor(ctx, settings, overrides = {}) {
     this.ctx = ctx;
     this.settings = settings;
     this.store = overrides.store ?? new InstanceStore({ file: settings.storeFile });
+    this.secrets = overrides.secrets ?? new SecretStore(secretsPathFor(settings.storeFile));
     this.runner = overrides.runner ?? createRunner(ctx.subprocess, { active: this.active });
   }
   ctx;
@@ -790,18 +974,17 @@ var RemoteInstanceService = class {
   active = /* @__PURE__ */ new Set();
   lifetime = new AbortController();
   store;
+  secrets;
   runner;
   sealed = false;
   seeded = false;
+  askpassDirectory;
+  askpassPath;
   /** 设备清单文件路径。 / The device-list path. */
   get storeDisplayPath() {
     return displayPath(this.store.path);
   }
-  /**
-   * 执行一个动作。`ui` 来源只允许清单与探测，且不索取审批。
-   * Execute one action. The `ui` source may only manage the list and probe, and
-   * never asks for approval.
-   */
+  /** 执行一个动作。`ui` 来源只允许清单与探测。 / Execute one action; the `ui` source may only manage the list and probe. */
   async execute(input, options = {}) {
     const args = validateRequest(input);
     if (this.sealed) throw new Error("Remote instance plugin is unloading");
@@ -831,30 +1014,40 @@ var RemoteInstanceService = class {
   /** 已登记的设备及其最近探测结论。 / Registered devices with their last probe. */
   async list() {
     const snapshot = await this.load();
+    const passwords = await this.secrets.load();
+    const summaries = [...snapshot.instances.values()].sort((left, right) => left.name.localeCompare(right.name)).map((instance) => instanceSummary(this.withAuth(instance, passwords.has(instance.name))));
     return {
       store: this.storeDisplayPath,
-      instances: [...snapshot.instances.values()].sort((left, right) => left.name.localeCompare(right.name)).map(instanceSummary),
+      instances: summaries,
       ...snapshot.skipped.length === 0 ? {} : { skipped: snapshot.skipped }
     };
   }
-  /** 探测一台设备：ssh 连通性、远端 dsh 版本、profile 目录与工作目录。 / Probe one device. */
+  /** 探测一台设备：认证方式由记录决定，平台未知时先试 POSIX 再试 Windows。 / Probe one device. */
   async probe(args, signal) {
     const instance = await this.findInstance(requireString(args.name, "name"));
     const started = Date.now();
+    let platform = instance.platform ?? "posix";
     let facts;
     let stderr = "";
     let message;
     let ok = false;
     try {
-      const result = await this.runner(
-        sshArgv(sshTargetOf(instance), remoteProbeCommand(instance), { connectTimeoutMs: this.settings.connectTimeoutMs }),
-        { signal, timeoutMs: this.settings.probeTimeoutMs }
-      );
-      facts = parseProbeOutput(result.stdout);
-      stderr = result.stderr.trim().slice(-4e3);
-      ok = result.exitCode === 0 && facts.version !== void 0 && facts.version !== "missing" && !/not found/i.test(facts.version);
-      if (!ok) message = stderr || (result.exitCode === 0 ? "the remote device reported no dsh version" : `ssh exited with code ${String(result.exitCode)}`);
-      else if (facts.profile === "missing") message = `the remote device has no profile "${instance.profile}"; create it there or register another profile`;
+      const first = await this.runProbe(instance, platform, signal);
+      facts = first.facts;
+      stderr = first.stderr;
+      if (!probeUsable(facts)) {
+        const other = platform === "posix" ? "windows" : "posix";
+        const second = await this.runProbe(instance, other, signal);
+        if (probeUsable(second.facts) || second.facts?.platform !== void 0) {
+          facts = second.facts;
+          stderr = second.stderr;
+          platform = second.platform;
+        }
+      }
+      platform = facts?.platform ?? platform;
+      ok = probeUsable(facts);
+      if (!ok) message = stderr || "the remote device reported no dsh version";
+      else if (facts?.profile === "missing") message = `the remote device has no profile "${instance.profile}"; create it there or register another profile`;
     } catch (error) {
       if (signal.aborted) throw error;
       message = safeMessage(error);
@@ -866,10 +1059,11 @@ var RemoteInstanceService = class {
       ...facts?.os === void 0 ? {} : { os: facts.os },
       ...message === void 0 ? {} : { message }
     };
-    const stored = await this.recordProbe(instance, probe);
+    const stored = await this.recordProbe(instance, probe, platform);
     return {
-      instance: instanceSummary(stored),
+      instance: instanceSummary(this.withAuth(stored, await this.hasPassword(stored.name))),
       ok,
+      platform,
       ...facts?.version === void 0 ? {} : { version: facts.version },
       ...facts?.os === void 0 ? {} : { os: facts.os },
       ...facts?.dshPath === void 0 ? {} : { dshPath: facts.dshPath },
@@ -881,15 +1075,19 @@ var RemoteInstanceService = class {
       elapsedMs: Date.now() - started
     };
   }
-  /** 新增或替换一台设备。 / Add or replace one device. */
+  /** 新增或替换一台设备；`password` 只写进密码文件。 / Add or replace one device; `password` only reaches the password file. */
   async add(args, options) {
+    const host = typeof args.host === "string" ? args.host : "";
+    const name2 = typeof args.name === "string" && args.name ? args.name : deriveInstanceName(host);
     const snapshot = await this.load();
-    const existing = snapshot.instances.get(String(args.name ?? ""));
+    const existing = snapshot.instances.get(name2);
     await this.authorize(args, options);
+    const password = args.password === void 0 ? void 0 : assertSecret(args.password);
+    const auth = password !== void 0 ? "password" : existing?.auth ?? "key";
     const instance = validateInstance(
       {
-        name: args.name,
-        host: args.host,
+        name: name2,
+        host,
         user: args.user,
         port: args.port,
         identityFile: args.identityFile,
@@ -898,16 +1096,19 @@ var RemoteInstanceService = class {
         dsh: args.dsh,
         shell: args.shell,
         cwd: args.cwd,
-        note: args.note
+        note: args.note,
+        auth,
+        platform: existing?.platform
       },
       { existing }
     );
+    if (password !== void 0) await this.secrets.set(instance.name, password);
     await this.store.update((instances) => {
       instances.set(instance.name, instance);
     });
-    return { instance: instanceSummary(instance), replaced: existing !== void 0 };
+    return { instance: instanceSummary(this.withAuth(instance, password !== void 0 || await this.hasPassword(instance.name))), replaced: existing !== void 0, auth };
   }
-  /** 移除一台设备。 / Remove one device. */
+  /** 移除一台设备及其保存的密码。 / Remove one device and its stored password. */
   async remove(args, options) {
     const name2 = requireString(args.name, "name");
     await this.authorize(args, options);
@@ -915,6 +1116,7 @@ var RemoteInstanceService = class {
     await this.store.update((instances) => {
       existed = instances.delete(name2);
     });
+    await this.secrets.delete(name2);
     return { removed: name2, existed };
   }
   /** 把一次任务派发给远端 DSH agent，作为本会话的并行后台作业。 / Dispatch one task as a parallel background job. */
@@ -925,9 +1127,12 @@ var RemoteInstanceService = class {
     if (!prompt.trim()) throw new Error("prompt is required");
     if (prompt.length > MAX_PROMPT) throw new Error(`prompt is too large (max ${MAX_PROMPT} characters)`);
     const sessionId = args.sessionId === void 0 ? void 0 : String(args.sessionId);
-    const command = remoteTaskCommand(instance, sessionId);
+    const platform = instance.platform ?? "posix";
+    const command = taskCommand(instance, platform, sessionId);
     await this.authorize(args, options);
-    const argv = sshArgv(sshTargetOf(instance), command, { connectTimeoutMs: this.settings.connectTimeoutMs });
+    if ((instance.auth ?? "key") === "password" && !await this.hasPassword(instance.name)) {
+      throw new Error(`remote instance "${instance.name}" needs a password; re-add it with the password field`);
+    }
     const controller = new AbortController();
     const owner = agent.id;
     const label = `Remote ${instance.name}: ${firstLine(prompt).slice(0, 60)}`;
@@ -943,7 +1148,7 @@ var RemoteInstanceService = class {
           let stderr = "";
           try {
             job.updateProgress(`connecting to ${instance.name}`);
-            const result = await this.runner(argv, {
+            const result = await this.exec(instance, command, {
               signal: controller.signal,
               stdin: prompt,
               timeoutMs: this.settings.taskTimeoutMs,
@@ -961,6 +1166,7 @@ var RemoteInstanceService = class {
             const parsed = parser.finish({ exitCode: result.exitCode, aborted: controller.signal.aborted, stderr });
             const payload = {
               instance: instance.name,
+              platform,
               status: parsed.status,
               answer: parsed.answer,
               toolCalls: parsed.toolCalls,
@@ -980,7 +1186,7 @@ ${detail}
           } catch (error) {
             const killed = controller.signal.aborted;
             const message = safeMessage(error).slice(-8e3);
-            this.remember(job.id, { instance: instance.name, status: killed ? "killed" : "failed", answer: "", error: message });
+            this.remember(job.id, { instance: instance.name, platform, status: killed ? "killed" : "failed", answer: "", error: message });
             if (!killed) job.append(`
 ${message}
 `, { channel: "stderr" });
@@ -999,7 +1205,7 @@ ${message}
       ...sessionId === void 0 ? {} : { sessionId },
       prompt: firstLine(prompt).slice(0, 200)
     });
-    return { jobId, instance: instance.name, status: "running", ...sessionId === void 0 ? {} : { sessionId } };
+    return { jobId, instance: instance.name, status: "running", platform, ...sessionId === void 0 ? {} : { sessionId } };
   }
   /** 本会话的远程作业。 / Remote jobs of this session. */
   listJobs(agent) {
@@ -1030,7 +1236,7 @@ ${message}
     const jobId = this.owned(requireString(args.jobId, "jobId"), agent);
     return { jobId, status: this.ctx.jobs.kill(jobId, agent.id, "Remote task cancelled by caller") };
   }
-  /** 停止全部在跑任务并等待进程退出。 / Stop every live task and wait for the processes. */
+  /** 停止全部在跑任务、清理 askpass 临时目录并等待进程退出。 / Stop live work and clean the askpass directory. */
   async dispose() {
     this.sealed = true;
     this.lifetime.abort(new Error("Remote instance plugin unloaded"));
@@ -1042,6 +1248,7 @@ ${message}
     }
     for (const child of this.active) child.terminate();
     await Promise.allSettled([...this.pending, ...[...this.active].map((child) => child.waitForExit())]);
+    if (this.askpassDirectory !== void 0) await rm(this.askpassDirectory, { recursive: true, force: true });
     this.results.clear();
     this.ownedJobs.clear();
     this.contexts.clear();
@@ -1069,12 +1276,53 @@ ${message}
     if (!instance) throw new Error(`Unknown remote instance "${name2}"; call instances to list the registered devices`);
     return instance;
   }
-  async recordProbe(instance, probe) {
-    const updated = { ...instance, lastProbe: probe };
+  withAuth(instance, hasPassword) {
+    const auth = instance.auth ?? (hasPassword ? "password" : "key");
+    return { ...instance, auth };
+  }
+  async hasPassword(name2) {
+    return await this.secrets.get(name2) !== void 0;
+  }
+  async recordProbe(instance, probe, platform) {
+    const updated = { ...instance, lastProbe: probe, platform };
     await this.store.update((instances) => {
       if (instances.has(instance.name)) instances.set(instance.name, updated);
     });
     return updated;
+  }
+  /** 用实例自己的认证方式跑一次探测。 / Run one probe with the instance's own authentication. */
+  async runProbe(instance, platform, signal) {
+    const result = await this.exec(instance, probeCommand(instance, platform), {
+      signal,
+      timeoutMs: this.settings.probeTimeoutMs
+    });
+    const facts = parseProbeOutput(result.stdout);
+    return { facts, stderr: result.stderr.trim().slice(-4e3), platform: facts.platform ?? platform };
+  }
+  /** 统一执行：按认证方式注入 askpass，密码只出现在环境里。 / Every run: askpass is injected per authentication mode, password only in the environment. */
+  async exec(instance, command, options) {
+    const auth = instance.auth ?? "key";
+    const argv = sshArgv(sshTargetOf(instance), command, { connectTimeoutMs: this.settings.connectTimeoutMs, auth });
+    let env;
+    if (auth === "password") {
+      const password = await this.secrets.get(instance.name);
+      if (password === void 0) throw new Error(`remote instance "${instance.name}" needs a password; re-add it with the password field`);
+      env = { ...askpassEnv(await this.askpassHelper()), DSH_REMOTE_PASSWORD: password };
+    }
+    return this.runner(argv, { ...options, ...env === void 0 ? {} : { env } });
+  }
+  /** 惰性创建 0700 的 askpass 助手；Windows 宿主没有可用的 askpass。 / Lazily create the 0700 askpass helper. */
+  async askpassHelper() {
+    if (process.platform === "win32") throw new Error("password authentication needs a POSIX ssh client; on a Windows host use a key instead");
+    if (this.askpassPath !== void 0) return this.askpassPath;
+    const directory = await mkdtemp(join2(tmpdir(), "dsh-ri-askpass-"));
+    await chmod2(directory, 448);
+    const file = join2(directory, "askpass.sh");
+    await writeFile3(file, ASKPASS_SCRIPT, { mode: 448 });
+    await chmod2(file, 448);
+    this.askpassDirectory = directory;
+    this.askpassPath = file;
+    return file;
   }
   owned(jobId, agent) {
     if (this.ownedJobs.get(jobId) !== agent.id) throw new Error("Unknown or foreign remote job");
@@ -1174,32 +1422,46 @@ function apply(ctx, config) {
 export {
   ACTIONS,
   ACTION_PATH,
+  ASKPASS_SCRIPT,
   InstanceStore,
   NAME_PATTERN,
   OBSERVE_PATH,
   READ_ACTIONS,
   RemoteInstanceService,
+  SecretStore,
   TOOL_DESCRIPTION,
   TOOL_NAME,
   apply,
+  askpassEnv,
+  assertSecret,
   createActionHandler,
   createObserveHandler,
   createRunner,
   createTaskParser,
   displayPath,
   displayTarget,
+  encodePowerShell,
   inject,
   instanceSummary,
   name,
   parseProbeOutput,
-  remoteProbeCommand,
-  remoteTaskCommand,
+  posixProbeCommand,
+  posixTaskCommand,
+  powershellCommand,
+  probeCommand,
+  psQuote,
+  posixProbeCommand as remoteProbeCommand,
+  posixTaskCommand as remoteTaskCommand,
   resolveDshHome,
   resolveSettings,
   restoreInstance,
   sameLoopbackOrigin,
+  secretsPathFor,
   shellQuote,
   sshArgv,
+  taskCommand,
   validateInstance,
-  validateRequest
+  validateRequest,
+  windowsProbeCommand,
+  windowsTaskCommand
 };

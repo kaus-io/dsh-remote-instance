@@ -12,6 +12,8 @@ export interface RunOptions {
   readonly signal?: AbortSignal
   readonly stdin?: string
   readonly timeoutMs?: number
+  /** 显式环境；密码认证的 askpass 变量在这里注入。 / Explicit environment carrying the askpass variables. */
+  readonly env?: Record<string, string>
   readonly onOutput?: (chunk: { readonly stream: 'stdout' | 'stderr'; readonly text: string }) => void
 }
 
@@ -35,7 +37,7 @@ export function createRunner(subprocess: SubprocessRuntime, options: { readonly 
   const active = options.active ?? new Set<SubprocessHandle>()
   const maxOutput = Math.min(Math.max(options.maxOutput ?? 262_144, 4_096), 4_194_304)
   return async function run(argv, runOptions = {}) {
-    const { signal, stdin, timeoutMs = 120_000, onOutput } = runOptions
+    const { signal, stdin, timeoutMs = 120_000, onOutput, env } = runOptions
     signal?.throwIfAborted()
     if (!Array.isArray(argv) || argv.length === 0 || argv.some(value => typeof value !== 'string' || value.includes('\0'))) {
       throw new Error('Invalid process argv')
@@ -55,6 +57,7 @@ export function createRunner(subprocess: SubprocessRuntime, options: { readonly 
       const executable = await subprocess.resolveExecutable(argv[0], undefined, controller.signal)
       child = subprocess.spawn({
         argv: [executable, ...argv.slice(1)],
+        ...(env === undefined ? {} : { env }),
         signal: controller.signal,
         graceMs: 3_000,
         stdio: { stdin: stdin === undefined ? 'ignore' : { data: stdin }, stdout: 'pipe', stderr: 'pipe' },
