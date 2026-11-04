@@ -58,6 +58,27 @@ export function sshArgv(target: SshTarget, remoteCommand: string, options: { rea
   if (typeof remoteCommand !== 'string' || remoteCommand.includes('\0')) throw new Error('remote command must be a string without NUL characters')
   if (!target.host) throw new Error('host is required')
   if (target.host.startsWith('-')) throw new Error('host must not start with -')
+  const argv = sshBaseArgv(target, options)
+  argv.push('--', target.host, remoteCommand)
+  return argv
+}
+
+/** 建隧道用的 ssh argv：只转发端口，不执行远端命令。 / ssh argv for a port-forward-only tunnel. */
+export function sshForwardArgv(
+  target: SshTarget,
+  options: { readonly localPort: number; readonly remotePort: number; readonly connectTimeoutMs: number; readonly auth?: AuthMode },
+): string[] {
+  if (!target.host) throw new Error('host is required')
+  if (!Number.isSafeInteger(options.localPort) || options.localPort < 1 || options.localPort > 65_535) throw new Error('local port must be 1-65535')
+  if (!Number.isSafeInteger(options.remotePort) || options.remotePort < 1 || options.remotePort > 65_535) throw new Error('remote port must be 1-65535')
+  const argv = sshBaseArgv(target, options)
+  argv.push('-N', '-L', `127.0.0.1:${options.localPort}:127.0.0.1:${options.remotePort}`)
+  argv.push('--', target.host)
+  return argv
+}
+
+/** 两种 ssh 调用共用的选项。 / Options shared by both ssh invocations. */
+function sshBaseArgv(target: SshTarget, options: { readonly connectTimeoutMs: number; readonly auth?: AuthMode }): string[] {
   const auth: AuthMode = options.auth ?? 'key'
   const argv = [
     'ssh',
@@ -77,7 +98,6 @@ export function sshArgv(target: SshTarget, remoteCommand: string, options: { rea
   if (target.identityFile) argv.push('-i', assertPlain(target.identityFile, 'identityFile'))
   if (target.proxyJump) argv.push('-J', assertPlain(target.proxyJump, 'proxyJump'))
   if (target.user) argv.push('-l', assertPlain(target.user, 'user'))
-  argv.push('--', target.host, remoteCommand)
   return argv
 }
 

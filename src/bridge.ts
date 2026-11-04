@@ -265,6 +265,11 @@ export async function startBridge(ctx: BridgeHost, options: BridgeOptions): Prom
   })
   const address = server.address()
   const port = typeof address === 'object' && address !== null ? address.port : options.port
+  // 端口是动态的，写一份描述文件让对端经 SSH 读到。 / The port is dynamic; publish it for the peer to read over SSH.
+  const descriptor = join(options.dshHome, 'remote-instance-bridge.json')
+  await mkdir(dirname(descriptor), { recursive: true })
+  await writeFile(descriptor, `${JSON.stringify({ port, token, pid: process.pid, startedAt: Date.now() }, null, 2)}\n`, { mode: 0o600 })
+  await chmod(descriptor, 0o600)
   return {
     port,
     token,
