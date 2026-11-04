@@ -43,7 +43,7 @@ function fakeClient() {
 describe('client bundle', () => {
   it('registers under the package id and exposes only the plugin face', async () => {
     const spec = await loadBundle()
-    assert.equal(spec.id, '@local/dsh-remote-instance')
+    assert.equal(spec.id, '@kaus-io/dsh-remote-instance')
     const exports = spec.factory(() => ({}))
     assert.deepEqual(Object.keys(exports).sort(), ['apply', 'inject'])
     assert.deepEqual([...exports.inject].sort(), ['locale', 'slots'])
@@ -95,7 +95,7 @@ describe('client bundle', () => {
 
   it('keeps the generated artifact committed and current', async () => {
     const source = await readFile(join(root, 'client.js'), 'utf8')
-    assert.match(source, /window\.__ModuleLoader__\.load\(\{ id: "@local\/dsh-remote-instance"/)
+    assert.match(source, /window\.__ModuleLoader__\.load\(\{ id: "@kaus-io\/dsh-remote-instance"/)
     assert.match(source, /\}\);\s*$/)
   })
 })

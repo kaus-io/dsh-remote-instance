@@ -1,4 +1,4 @@
 # Remote Instance bundle layer: one Host row; the browser half rides `dsh.client`.
 - insert:
     - id: remote-instance
-      name: '@local/dsh-remote-instance'
+      name: '@kaus-io/dsh-remote-instance'

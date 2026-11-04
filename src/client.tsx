@@ -12,7 +12,7 @@ import type { FormEvent, ReactElement, ReactNode } from 'react'
 /** 本插件的词典命名空间。 / Dictionary namespace owned by this plugin. */
 const NS = 'remoteInstance'
 /** 样式标签身份；一个已安装代次一个标签。 / Stable style-tag identity. */
-const STYLE_ID = '@local/dsh-remote-instance/RemoteInstances.css'
+const STYLE_ID = '@kaus-io/dsh-remote-instance/RemoteInstances.css'
 const OBSERVE_PATH = '/remote-instance/observe'
 const ACTION_PATH = '/remote-instance/action'
 const ARM_TIMEOUT_MS = 3_000

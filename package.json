@@ -1,10 +1,22 @@
 {
-  "name": "@local/dsh-remote-instance",
+  "name": "@kaus-io/dsh-remote-instance",
   "version": "1.0.0",
-  "private": true,
   "description": "Remote DSH instances over SSH: register another device's dsh, probe it, and dispatch tasks to its agent as parallel background jobs",
   "type": "module",
   "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "remote",
+    "ssh",
+    "agent"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.5 <0.3.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

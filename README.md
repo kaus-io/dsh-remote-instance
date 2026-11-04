@@ -85,7 +85,7 @@ cd ~/.dsh/profiles/web
 pnpm add link:/home/zxhhyj/AndroidStudioProjects/kaus-workspace/projects/dsh-remote-instance
 ```
 
-然后把 `@local/dsh-remote-instance` 追加到该 `package.json` 的 `dsh.profile.bundles`。`patchReload: startup` 的 profile 需要重启 `dsh web` 才会加载新 bundle。
+然后把 `@kaus-io/dsh-remote-instance` 追加到该 `package.json` 的 `dsh.profile.bundles`。`patchReload: startup` 的 profile 需要重启 `dsh web` 才会加载新 bundle。
 
 ## 源码与构建
 
