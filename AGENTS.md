@@ -43,6 +43,8 @@
 - 版本一致性检查是 `scripts/check-versions.mjs`：`package.json`、`client.js` 构建横幅、README 里固定的安装版本、CHANGELOG 顶部条目必须同一个版本；Release 运行时再加 `--tag` 比对 tag（`v<version>` 或裸版本号）。
 - `.github/workflows/release.yml`：GitHub Release `published` 触发。先在安装依赖之前跑上面这条检查（失败即停），再跑同一套 CI 检查，拒绝已存在的 npm 版本，最后用 `scripts/dist-tag.mjs` 推导 dist-tag 发布：稳定版 `latest`，预发布 `alpha`/`beta`/`rc`。
 - 升版本时必须同时改 README 的安装命令与 CHANGELOG 顶部条目，否则版本检查直接失败；CI 不改写版本号，版本只有 `package.json` 一个来源，顺序固定为「bump → rebuild → 更新 README/CHANGELOG → commit → 打 tag → 建 release」。
+- **CI 红过的版本不升号**：修在同一版本上重试——改代码、重新构建、重跑检查，需要时把该版本的 tag 移到修复提交。只有已经发到 npm 或用户明确要求时才 bump。
+- 移动/删除远端 tag 是改远端引用，只有用户明确要求才做；做完整理新旧指向，并说明「没发出去」的版本号是否保留。
 - 仓库 secret `NPM_TOKEN` 必须能发布 `@kaus-io` 下的包；令牌不写进任何文件。要 provenance 时再加 `id-token: write` 与 `--provenance`。
 - 预发布绝不能发成 `latest`，否则用户默认装到 alpha；dist-tag 交给脚本推导，不要在 workflow 里手写 `--tag`。
 
