@@ -45,7 +45,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
   const service = new RemoteInstanceService(ctx, settings)
 
   ctx.effect(() => () => service.dispose(), 'remote-instance.dispose')
-  if (settings.bridgePort > 0) {
+  if (settings.bridge) {
     void startBridge(
       { get: name => ctx.get?.(name), ...(ctx.logger === undefined ? {} : { logger: ctx.logger }) },
       { port: settings.bridgePort, tokenFile: settings.bridgeTokenFile, dshHome: dirname(settings.storeFile) },

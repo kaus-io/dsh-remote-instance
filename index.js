@@ -461,7 +461,6 @@ function sessionRow(value) {
 }
 async function startBridge(ctx, options) {
   if (!Number.isSafeInteger(options.port) || options.port < 0 || options.port > 65535) throw new Error("bridge port must be 0-65535");
-  if (options.port === 0) return { port: 0, token: "", close: async () => void 0 };
   const token = await ensureToken(options.tokenFile);
   const host = options.host ?? "127.0.0.1";
   const controller = () => {
@@ -926,7 +925,7 @@ var LIMITS = {
   maxOutputBytes: [4096, 4194304, 262144],
   bridgePort: [0, 65535, 0]
 };
-var KNOWN_KEYS = /* @__PURE__ */ new Set(["storeFile", "bridgeTokenFile", ...Object.keys(LIMITS), "instances"]);
+var KNOWN_KEYS = /* @__PURE__ */ new Set(["storeFile", "bridgeTokenFile", "bridge", ...Object.keys(LIMITS), "instances"]);
 function expandHome(value) {
   if (value === "~") return homedir();
   if (value.startsWith(`~${sep}`) || value.startsWith("~/") || value.startsWith("~\\")) return join2(homedir(), value.slice(2));
@@ -994,6 +993,7 @@ function resolveSettings(config) {
     taskTimeoutMs: readInteger(source, "taskTimeoutMs"),
     maxOutputBytes: readInteger(source, "maxOutputBytes"),
     seed: seed === void 0 ? [] : seed,
+    bridge: source.bridge !== false,
     bridgePort: readInteger(source, "bridgePort"),
     bridgeTokenFile: readBridgeTokenFile(source, readStoreFile(source))
   };
@@ -2679,7 +2679,7 @@ function apply(ctx, config) {
   const settings = resolveSettings(config);
   const service = new RemoteInstanceService(ctx, settings);
   ctx.effect(() => () => service.dispose(), "remote-instance.dispose");
-  if (settings.bridgePort > 0) {
+  if (settings.bridge) {
     void startBridge(
       { get: (name2) => ctx.get?.(name2), ...ctx.logger === void 0 ? {} : { logger: ctx.logger } },
       { port: settings.bridgePort, tokenFile: settings.bridgeTokenFile, dshHome: dirname5(settings.storeFile) }

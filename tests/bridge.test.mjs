@@ -86,11 +86,11 @@ describe('bridge service', () => {
     assert.equal(unknown.status, 404)
   })
 
-  it('stays inert when the port is zero', async () => {
+  it('picks an ephemeral port when asked for zero', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'ri-bridge-'))
     directories.push(dir)
     const bridge = await startBridge(fakeHost([]), { port: 0, tokenFile: join(dir, 'token'), dshHome: dir })
-    assert.equal(bridge.port, 0)
+    assert.ok(bridge.port > 0)
     await bridge.close()
   })
 })

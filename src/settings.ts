@@ -22,7 +22,9 @@ export interface ServiceSettings {
   readonly maxOutputBytes: number
   /** 清单文件不存在时写入的首轮设备；默认空。 / Devices seeded when the list file is absent; empty by default. */
   readonly seed: readonly unknown[]
-  /** 桥接监听端口；0 表示关闭。 / Bridge listen port; 0 disables it. */
+  /** 是否启动桥接服务；默认开。 / Whether to start the bridge; on by default. */
+  readonly bridge: boolean
+  /** 桥接监听端口；0 表示自动分配。 / Bridge listen port; 0 picks one automatically. */
   readonly bridgePort: number
   /** 桥接 token 文件；默认与清单同目录。 / Bridge token file; beside the list by default. */
   readonly bridgeTokenFile: string
@@ -36,7 +38,7 @@ const LIMITS = {
   bridgePort: [0, 65_535, 0],
 } as const satisfies Record<string, readonly [number, number, number]>
 
-const KNOWN_KEYS = new Set<string>(['storeFile', 'bridgeTokenFile', ...Object.keys(LIMITS), 'instances'])
+const KNOWN_KEYS = new Set<string>(['storeFile', 'bridgeTokenFile', 'bridge', ...Object.keys(LIMITS), 'instances'])
 
 /** 展开只针对当前用户 home 的 `~` 前缀；其它形式原样返回。 / Expand a bare or current-user `~`; everything else passes through. */
 export function expandHome(value: string): string {
@@ -120,6 +122,7 @@ export function resolveSettings(config: unknown): ServiceSettings {
     taskTimeoutMs: readInteger(source, 'taskTimeoutMs'),
     maxOutputBytes: readInteger(source, 'maxOutputBytes'),
     seed: seed === undefined ? [] : (seed as readonly unknown[]),
+    bridge: source.bridge !== false,
     bridgePort: readInteger(source, 'bridgePort'),
     bridgeTokenFile: readBridgeTokenFile(source, readStoreFile(source)),
   }

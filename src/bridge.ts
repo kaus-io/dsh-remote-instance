@@ -174,7 +174,6 @@ function sessionRow(value: unknown): SessionRow | undefined {
  */
 export async function startBridge(ctx: BridgeHost, options: BridgeOptions): Promise<BridgeHandle> {
   if (!Number.isSafeInteger(options.port) || options.port < 0 || options.port > 65_535) throw new Error('bridge port must be 0-65535')
-  if (options.port === 0) return { port: 0, token: '', close: async () => undefined }
   const token = await ensureToken(options.tokenFile)
   const host = options.host ?? '127.0.0.1'
   const controller = (): SessionControllerLike | undefined => {

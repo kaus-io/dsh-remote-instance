@@ -89,7 +89,7 @@ describe('apply', () => {
 
   it('registers the tool and the two authenticated routes', async () => {
     const ctx = fakeHost()
-    apply(ctx, { storeFile: join(await workdir(), 'remote-instances.json') })
+    apply(ctx, { storeFile: join(await workdir(), 'remote-instances.json'), bridge: false })
     assert.equal(ctx.registered.tools.length, 1)
     const tool = ctx.registered.tools[0]
     assert.equal(tool.name, TOOL_NAME)
