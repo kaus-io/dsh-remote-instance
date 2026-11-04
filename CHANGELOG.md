@@ -2,7 +2,9 @@
 
 ## 1.0.0-alpha05
 
-- 修复 ACP 连接失败会拖垮宿主进程的问题：子进程退出后写 stdin 会异步抛 `error`，此前没有监听器，未处理的事件会让整个 Host 崩溃。现在 socket 错误被接住，请求以「cannot open the ACP link …」可读错误失败，并补了回归测试。
+- 会话操作改成**插件自带桥接服务**：每台装了插件的 DSH 在宿主进程里起一个只绑 `127.0.0.1`、端口自动分配的 HTTP 服务（`/v1/info`、`/v1/sessions`、`/v1/history`、`/v1/create`、`/v1/prompt`、`/v1/cancel`），端口与 token 写进 `$DSH_HOME/remote-instance-bridge.json`（`0600`）；对端插件读描述文件、拉 `ssh -N -L` 隧道调用。
+- 不再依赖远端 `dsh --profile acp` / `headless`：桌面版（只有 Electron）也能被当设备使用；会话能力走 Host 公共的 `sessionController`。
+- 修复 ACP 连接失败会拖垮宿主进程的问题（子进程退出后写 stdin 的未处理 `error`），若仍在 ACP 模式下使用会被接住并给出可读错误。
 
 ## 1.0.0-alpha04
 

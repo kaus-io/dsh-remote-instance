@@ -39,7 +39,9 @@ dsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha05
 - `history`：读远端会话历史；能读到远端日志时来自日志，否则只显示打开之后的消息。
 - `send` / `stop` / `close`：发消息、停当前回合、关闭会话。
 
-远端会话走 ACP（`dsh --profile acp`）：`session/list`、`session/new`、`session/resume`、`session/prompt`、`session/update`、`session/cancel`、`session/close`。ACP 没有 `session/load`，所以历史回放读的是远端 `$DSH_HOME/sessions/**` 的日志（zstd + JSONL v4，上限 8 MB）。
+会话操作不再需要远端 `dsh` 命令：**每台装了这个插件的 DSH 都会在自己的进程里起一个只绑 `127.0.0.1` 的 HTTP 服务**（端口自动分配，端点 `/v1/info`、`/v1/sessions`、`/v1/history`、`/v1/create`、`/v1/prompt`、`/v1/cancel`），把端口与 token 写进 `$DSH_HOME/remote-instance-bridge.json`（`0600`）。对端插件读这个文件、拉一条 `ssh -N -L` 隧道进去调用，所以桌面版（只有 Electron、没有 CLI）也能被当设备用。
+
+会话能力走 Host 公共的 `sessionController`；历史读本机 `$DSH_HOME/sessions/**` 的日志（zstd 多帧 + JSONL v4，上限 8 MB）。
 
 远端要有能跑起来的 `dsh`：Linux/macOS 在登录 shell 的 `PATH` 里；Windows 在 PowerShell 里可执行（路径含空格就填绝对路径）。`headless` profile 默认不读 GUI 保存的登录凭据，远端要有 `DEEPSEEK_API_KEY`。
 
@@ -49,7 +51,7 @@ dsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha05
 - 首次连接接受并锁定主机指纹（`StrictHostKeyChecking=accept-new`），指纹变化仍然失败。
 - 密码认证要求运行 DSH 的机器有 POSIX `ssh` 客户端（`SSH_ASKPASS`）；Windows 宿主请改用密钥。
 - 通过工具传 `password` 会被记进会话日志，优先用设置面板填写。
-- 远端 agent 的工具权限请求由 ACP 客户端答复：当前策略是允许一次，并在对话里留一条「已自动允许」的记录。
+- 桥接服务只绑回环、全部端点要 Bearer token；token 只有同用户可读，隧道只在使用时建立。
 - 历史读取是固定只读命令 + 会话 id 白名单 + 8 MB 压缩上限，不会变成任意文件读取。
 
 ### 参与贡献
