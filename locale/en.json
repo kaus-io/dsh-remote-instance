@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote Instance",
+    "description": "Connect to another device's DSH instance over SSH: register devices, probe reachability and version, and dispatch tasks to the remote DSH agent as parallel background jobs, with a Settings panel for the device list."
+  }
+}
