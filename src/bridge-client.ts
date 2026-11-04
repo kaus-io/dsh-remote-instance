@@ -37,7 +37,9 @@ export interface BridgeClientOptions {
   /** 建隧道的 argv。 / argv that opens the tunnel. */
   readonly tunnelArgv: (forward: { readonly localPort: number; readonly remotePort: number }) => readonly string[]
   /** 远端描述文件路径。 / Remote descriptor path. */
-  readonly descriptorPath: string
+  readonly descriptorPath?: string
+  /** 直接给出一条读描述文件的远端命令（跨平台时用）。 / A ready-made remote command that prints the descriptor. */
+  readonly descriptorCommand?: string
   /** 隧道就绪等待上限，默认 10s。 / Tunnel readiness ceiling; 10s by default. */
   readonly openTimeoutMs?: number
   /** 便于测试的 fetch 替身。 / Injectable fetch for tests. */
@@ -88,9 +90,10 @@ export class BridgeClient {
   /** 读对端的端口与 token。 / Read the peer's port and token. */
   async discover(): Promise<BridgeDescriptor> {
     if (this.#descriptor) return this.#descriptor
-    const path = this.#options.descriptorPath
-    if (!path) throw new Error('bridge descriptor path is not configured')
-    const result = await this.#options.exec(this.#options.commandArgv(`cat ${shellQuote(path)}`))
+    const command = this.#options.descriptorCommand
+      ?? (this.#options.descriptorPath === undefined ? undefined : `cat ${shellQuote(this.#options.descriptorPath)}`)
+    if (command === undefined) throw new Error('bridge descriptor path is not configured')
+    const result = await this.#options.exec(this.#options.commandArgv(command))
     if (result.exitCode !== 0) {
       throw new Error(`cannot read the peer bridge descriptor: ${(result.stderr || result.stdout).trim().slice(0, 300) || `exit ${String(result.exitCode)}`}`)
     }

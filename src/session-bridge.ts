@@ -48,13 +48,14 @@ export class SessionBridge {
   readonly #client: BridgeClient
   #disposed = false
 
-  constructor(descriptorPath: string, deps: SessionBridgeDeps) {
+  constructor(descriptorPath: string | undefined, deps: SessionBridgeDeps, descriptorCommand?: string) {
     this.#client = new BridgeClient({
       exec: deps.exec,
       spawn: deps.spawn,
       commandArgv: deps.commandArgv,
       tunnelArgv: deps.tunnelArgv,
-      descriptorPath,
+      ...(descriptorPath === undefined ? {} : { descriptorPath }),
+      ...(descriptorCommand === undefined ? {} : { descriptorCommand }),
     })
   }
 
