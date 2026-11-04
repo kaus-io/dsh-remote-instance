@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.0.0-alpha05
+
+- 修复 ACP 请求的超时定时器被 `unref` 的问题：Node 22 下事件循环可能先结束，请求永不 settle，导致 CI 的 `Times out an unanswered request` 悬空。定时器现在保持引用，请求一定会以超时失败。
+- 修复 ACP 连接关闭时的兜底计时器未清理：每个连接会多等 3 秒（`dispose`），整轮测试被拖到 30 秒。
+- `session/prompt` 不再使用「无限等待」，改为 30 分钟上限，超时会以可读错误结束而不是挂住。
+
 ## 1.0.0-alpha04
 
 - 会话控制：新增 ACP（`dsh --profile acp`）通道——`sessions` 列出远端 DSH 自己的会话，`new` 在指定目录新开，`history` 读历史，`send` 发消息并流式接收 `session/update`，`stop`/`close` 停止或关闭。

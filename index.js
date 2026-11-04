@@ -493,7 +493,7 @@ var AcpClient = class _AcpClient {
     const result = await this.request(
       "session/prompt",
       { sessionId, prompt: [{ type: "text", text }] },
-      { timeoutMs: 0, signal: promptOptions.signal }
+      { timeoutMs: promptOptions.timeoutMs ?? 30 * 6e4, signal: promptOptions.signal }
     );
     return { stopReason: typeof result?.stopReason === "string" ? result.stopReason : "end_turn" };
   }
@@ -523,7 +523,18 @@ var AcpClient = class _AcpClient {
       this.transport.terminate();
     } catch {
     }
-    await Promise.race([this.transport.closed, new Promise((resolve) => setTimeout(resolve, 3e3))]).catch(() => void 0);
+    let fallback;
+    try {
+      await Promise.race([
+        this.transport.closed,
+        new Promise((resolve) => {
+          fallback = setTimeout(resolve, 3e3);
+        })
+      ]);
+    } catch {
+    } finally {
+      if (fallback !== void 0) clearTimeout(fallback);
+    }
   }
   write(message) {
     if (this.disposed) throw new AcpConnectionError("the ACP connection closed");
@@ -561,8 +572,7 @@ var AcpClient = class _AcpClient {
         } catch {
         }
       };
-      if (timeoutMs > 0) entry.timer.unref?.();
-      else clearTimeout(entry.timer);
+      if (timeoutMs <= 0) clearTimeout(entry.timer);
       this.pending.set(id, entry);
       if (options.signal?.aborted) {
         abort();

@@ -26,7 +26,7 @@ export interface AcpSessionClient {
   listSessions(cwd?: string): Promise<readonly AcpSession[]>
   newSession(cwd: string): Promise<string>
   resumeSession(sessionId: string, cwd?: string): Promise<void>
-  prompt(sessionId: string, text: string, options?: { readonly signal?: AbortSignal }): Promise<{ readonly stopReason: string }>
+  prompt(sessionId: string, text: string, options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number }): Promise<{ readonly stopReason: string }>
   cancel(sessionId: string): Promise<void>
   closeSession(sessionId: string): Promise<void>
   dispose(): Promise<void>
@@ -124,12 +124,12 @@ export class AcpClient implements AcpSessionClient {
     this.live.add(sessionId)
   }
 
-  async prompt(sessionId: string, text: string, promptOptions: { readonly signal?: AbortSignal } = {}): Promise<{ readonly stopReason: string }> {
+  async prompt(sessionId: string, text: string, promptOptions: { readonly signal?: AbortSignal; readonly timeoutMs?: number } = {}): Promise<{ readonly stopReason: string }> {
     await this.resumeSession(sessionId)
     const result = (await this.request(
       'session/prompt',
       { sessionId, prompt: [{ type: 'text', text }] },
-      { timeoutMs: 0, signal: promptOptions.signal },
+      { timeoutMs: promptOptions.timeoutMs ?? 30 * 60_000, signal: promptOptions.signal },
     )) as { stopReason?: unknown }
     return { stopReason: typeof result?.stopReason === 'string' ? result.stopReason : 'end_turn' }
   }
@@ -156,7 +156,14 @@ export class AcpClient implements AcpSessionClient {
     }
     try { this.transport.stdin.end() } catch { /* the child may already be gone / 子进程可能已退出。 */ }
     try { this.transport.terminate() } catch { /* ignore / 忽略。 */ }
-    await Promise.race([this.transport.closed, new Promise(resolve => setTimeout(resolve, 3_000))]).catch(() => undefined)
+    let fallback: NodeJS.Timeout | undefined
+    try {
+      await Promise.race([
+        this.transport.closed,
+        new Promise(resolve => { fallback = setTimeout(resolve, 3_000) }),
+      ])
+    } catch { /* the transport may already be gone / 连接可能已断开。 */ }
+    finally { if (fallback !== undefined) clearTimeout(fallback) }
   }
 
   private write(message: Record<string, unknown>): void {
@@ -187,8 +194,8 @@ export class AcpClient implements AcpSessionClient {
         entry.reject(new AcpConnectionError(`ACP request cancelled: ${method}`))
         try { this.notify('session/cancel', params) } catch { /* ignore / 忽略。 */ }
       }
-      if (timeoutMs > 0) entry.timer.unref?.()
-      else clearTimeout(entry.timer)
+      // 定时器必须保持引用：unref 后事件循环可能先结束，请求永远不 settle。 / Keep the timer referenced.
+      if (timeoutMs <= 0) clearTimeout(entry.timer)
       this.pending.set(id, entry)
       if (options.signal?.aborted) { abort(); return }
       options.signal?.addEventListener('abort', abort, { once: true })

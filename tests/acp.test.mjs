@@ -32,6 +32,9 @@ function harness(handler) {
     notify: (method, params) => inbound.push(JSON.stringify({ jsonrpc: '2.0', method, params })),
     request: (id, method, params) => inbound.push(JSON.stringify({ jsonrpc: '2.0', id, method, params })),
   }
+  // closed 在连接结束时兑现，dispose 才不会等满兜底超时。 / closed settles on teardown so dispose does not wait for its fallback.
+  let settleClosed
+  const closed = new Promise(resolve => { settleClosed = resolve })
   const transport = {
     stdin: {
       write(text) {
@@ -42,8 +45,8 @@ function harness(handler) {
       end() { inbound.end() },
     },
     lines: inbound.iterate(),
-    closed: new Promise(() => {}),
-    terminate() { inbound.end() },
+    closed,
+    terminate() { inbound.end(); settleClosed() },
   }
   return { transport, sent, ...tools }
 }
