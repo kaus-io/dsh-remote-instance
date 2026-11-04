@@ -31,6 +31,11 @@ function sshArgv(target, remoteCommand, options) {
   if (typeof remoteCommand !== "string" || remoteCommand.includes("\0")) throw new Error("remote command must be a string without NUL characters");
   if (!target.host) throw new Error("host is required");
   if (target.host.startsWith("-")) throw new Error("host must not start with -");
+  const argv = sshBaseArgv(target, options);
+  argv.push("--", target.host, remoteCommand);
+  return argv;
+}
+function sshBaseArgv(target, options) {
   const auth = options.auth ?? "key";
   const argv = [
     "ssh",
@@ -55,7 +60,6 @@ function sshArgv(target, remoteCommand, options) {
   if (target.identityFile) argv.push("-i", assertPlain(target.identityFile, "identityFile"));
   if (target.proxyJump) argv.push("-J", assertPlain(target.proxyJump, "proxyJump"));
   if (target.user) argv.push("-l", assertPlain(target.user, "user"));
-  argv.push("--", target.host, remoteCommand);
   return argv;
 }
 function parseProbeOutput(stdout) {
@@ -530,6 +534,11 @@ async function startBridge(ctx, options) {
   });
   const address = server.address();
   const port = typeof address === "object" && address !== null ? address.port : options.port;
+  const descriptor = join(options.dshHome, "remote-instance-bridge.json");
+  await mkdir(dirname(descriptor), { recursive: true });
+  await writeFile(descriptor, `${JSON.stringify({ port, token, pid: process.pid, startedAt: Date.now() }, null, 2)}
+`, { mode: 384 });
+  await chmod(descriptor, 384);
   return {
     port,
     token,
