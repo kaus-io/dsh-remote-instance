@@ -1864,18 +1864,40 @@ ${message}
       } catch {
       }
     })();
+    let resolveClosed = () => void 0;
+    const closed = new Promise((resolve) => {
+      resolveClosed = () => resolve();
+    });
+    void child.done.then(() => resolveClosed(), () => resolveClosed());
+    stdin.on("error", () => resolveClosed());
+    let ended = false;
     const transport = {
-      stdin: { write: (text) => {
-        stdin.write(text);
-      }, end: () => {
-        try {
-          stdin.end();
-        } catch {
+      stdin: {
+        write: (text) => {
+          if (ended) throw new Error("the ACP stdin is closed");
+          try {
+            stdin.write(text);
+          } catch (error) {
+            ended = true;
+            resolveClosed();
+            throw error;
+          }
+        },
+        end: () => {
+          ended = true;
+          try {
+            stdin.end();
+          } catch {
+          }
         }
-      } },
+      },
       lines: linesOf(child.stdout),
-      closed: child.done.then(() => void 0, () => void 0),
-      terminate: () => child.terminate()
+      closed,
+      terminate: () => {
+        ended = true;
+        child.terminate();
+        resolveClosed();
+      }
     };
     try {
       return await AcpClient.connect(transport, {

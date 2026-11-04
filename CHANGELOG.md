@@ -1,5 +1,9 @@
 # 更新日志
 
+## 1.0.0-alpha05
+
+- 修复 ACP 连接失败会拖垮宿主进程的问题：子进程退出后写 stdin 会异步抛 `error`，此前没有监听器，未处理的事件会让整个 Host 崩溃。现在 socket 错误被接住，请求以「cannot open the ACP link …」可读错误失败，并补了回归测试。
+
 ## 1.0.0-alpha04
 
 - 会话控制：新增 ACP（`dsh --profile acp`）通道——`sessions` 列出远端 DSH 自己的会话，`new` 在指定目录新开，`history` 读历史，`send` 发消息并流式接收 `session/update`，`stop`/`close` 停止或关闭。

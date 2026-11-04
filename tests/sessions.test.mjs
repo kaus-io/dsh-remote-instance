@@ -104,6 +104,34 @@ describe('remote sessions over ACP', () => {
   })
 })
 
+describe('ACP link failures', () => {
+  it('rejects cleanly when the child dies while writing its stdin', async () => {
+    const { EventEmitter } = await import('node:events')
+    const ctx = fakeHost()
+    const directory = await workdir()
+    const settings = resolveSettings({ storeFile: join(directory, 'remote-instances.json') })
+    const stdin = new EventEmitter()
+    stdin.write = () => { setTimeout(() => stdin.emit('error', new Error('write after end')), 5); return true }
+    stdin.end = () => {}
+    const empty = (async function* () {})()
+    ctx.subprocess.spawn = () => ({
+      stdin,
+      stdout: empty,
+      stderr: empty,
+      done: new Promise(resolve => setTimeout(() => resolve({ exitCode: 1 }), 20)),
+      terminate() {},
+      waitForExit: async () => undefined,
+    })
+    const service = new RemoteInstanceService(ctx, settings)
+    await service.execute({ action: 'add', name: 'dead', host: 'dead.lan', user: 'me', password: 'pw' }, { source: 'ui' })
+    await assert.rejects(
+      () => service.execute({ action: 'sessions', name: 'dead' }, { source: 'ui' }),
+      /cannot open the ACP link/,
+    )
+    await service.dispose()
+  })
+})
+
 describe('remote history from the session log', () => {
   it('reads the remote log, decompresses it, and parses the messages', async () => {
     const log = [

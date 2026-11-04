@@ -618,11 +618,25 @@ export class RemoteInstanceService {
         for await (const chunk of child.stderr ?? []) stderr = (stderr + Buffer.from(chunk).toString('utf8')).slice(-4_000)
       } catch { /* the pipe closed / 管道已关闭。 */ }
     })()
+    // 子进程退出后写 stdin 会异步抛 'error'；没有监听器会直接把宿主进程打挂。
+    // Writing to a dead child's stdin emits 'error' asynchronously; without a
+    // listener that unhandled event would take the whole Host process down.
+    let resolveClosed: () => void = () => undefined
+    const closed = new Promise<void>(resolve => { resolveClosed = () => resolve() })
+    void child.done.then(() => resolveClosed(), () => resolveClosed())
+    stdin.on('error', () => resolveClosed())
+    let ended = false
     const transport: AcpTransport = {
-      stdin: { write: text => { stdin.write(text) }, end: () => { try { stdin.end() } catch { /* ignore / 忽略。 */ } } },
+      stdin: {
+        write: text => {
+          if (ended) throw new Error('the ACP stdin is closed')
+          try { stdin.write(text) } catch (error) { ended = true; resolveClosed(); throw error }
+        },
+        end: () => { ended = true; try { stdin.end() } catch { /* ignore / 忽略。 */ } },
+      },
       lines: linesOf(child.stdout),
-      closed: child.done.then(() => undefined, () => undefined),
-      terminate: () => child.terminate(),
+      closed,
+      terminate: () => { ended = true; child.terminate(); resolveClosed() },
     }
     try {
       return await AcpClient.connect(transport, {

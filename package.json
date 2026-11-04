@@ -1,6 +1,6 @@
 {
   "name": "@kaus-io/dsh-remote-instance",
-  "version": "1.0.0-alpha04",
+  "version": "1.0.0-alpha05",
   "description": "Remote DSH instances over SSH: register another device's dsh, probe it, and dispatch tasks to its agent as parallel background jobs",
   "type": "module",
   "packageManager": "pnpm@10.28.2",
