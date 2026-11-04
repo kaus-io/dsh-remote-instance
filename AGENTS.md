@@ -12,6 +12,14 @@
 - 两种模式都用 `StrictHostKeyChecking=accept-new`：首次接受并锁定指纹，指纹变化仍然失败；`-o LogLevel=ERROR` 只用来压掉 ssh 自身的噪声警告。
 - 所有进程经 `ctx.subprocess` 托管，`createRunner` 负责取消、超时与等待整棵进程树退出；不要直接 `child_process`。
 
+## 远端会话（ACP）
+
+- 会话通道只走 `dsh --profile acp`：换行分帧的 JSON-RPC 2.0，方法集合限定在 `initialize`、`session/list`、`session/new`、`session/resume`、`session/prompt`、`session/cancel`、`session/close`；不要接 `fs/*`、`terminal/*` 等客户端方法。
+- 每条设备一条连接，按需建立、失败后下次调用重连、卸载时关闭；请求必须有超时，prompt 用长超时并接受取消。
+- `session/request_permission` 必须显式答复并留痕：当前策略是「允许一次」并往对话里写一条记录；不要静默拒绝却不告知用户。
+- 历史回放是**只读、固定命令**：`historyCommand` 只按 `sessionId` 白名单找 `$DSH_HOME/sessions/*/<id>/*.jsonl.zstd`，压缩上限 `MAX_LOG_BYTES`，本地按 zstd 帧解压；不得扩展成任意文件读取或写远端。
+- ACP 不回放历史是协议限制；任何「历史」实现都必须说明来源（日志 / 打开后实时），不能假装完整。
+
 ## 权限与清单
 
 - `add`/`remove`/`ask` 是原生操作：Full Access 会话放行，否则必须 `ctx.approval.request` 得到 `allowed-once`；`ui` 来源来自用户本人点击，不得再弹审批，也不得把审批结果当成模型可伪造的参数。

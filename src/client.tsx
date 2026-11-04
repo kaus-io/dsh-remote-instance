@@ -69,8 +69,8 @@ const EMPTY_DRAFT: Draft = {
 
 /** 面板从 `inject` 拿到的 Host 访问方式。 / Host access handed to the panel through `inject`. */
 interface PanelApi {
-  read(args: Record<string, unknown>): Promise<unknown>
-  act(args: Record<string, unknown>): Promise<unknown>
+  read(args: Record<string, unknown>, sessionId?: string): Promise<unknown>
+  act(args: Record<string, unknown>, sessionId?: string): Promise<unknown>
 }
 
 interface SectionProps {
@@ -111,6 +111,25 @@ const ZH: Record<string, string> = {
   hintPassword: '用于 ssh 密码登录；留空表示沿用已保存的密码，新设备留空则改用密钥',
   authPassword: '密码',
   authKey: '密钥',
+  remote: '远程',
+  panelTitle: '远程实例',
+  deviceLabel: '设备',
+  noDevice: '还没有设备，先在设置 → 远程实例里添加。',
+  sessionsLabel: '会话',
+  noSessions: '这台设备上还没有会话。',
+  newSession: '新会话',
+  cwdLabel: '工作目录',
+  cwdHint: '远端绝对路径，例如 /home/me/project',
+  chatLabel: '对话',
+  emptyChat: '选一个会话，或新建一个。',
+  promptPlaceholder: '给远端 agent 发消息…（Enter 发送，Shift+Enter 换行）',
+  send: '发送',
+  sending: '发送中…',
+  stop: '停止',
+  sourceLog: '历史来自远端日志',
+  sourceLive: '仅显示打开后的消息',
+  running: '运行中',
+  idle: '空闲',
   advanced: '高级',
   fieldIdentity: '私钥路径',
   fieldJump: '跳板机（-J）',
@@ -167,6 +186,25 @@ const EN: Record<string, string> = {
   hintPassword: 'Used for ssh password login; blank keeps a saved password, and a new device with no password falls back to a key',
   authPassword: 'password',
   authKey: 'key',
+  remote: 'Remote',
+  panelTitle: 'Remote instances',
+  deviceLabel: 'Device',
+  noDevice: 'No device yet. Add one in Settings → Remote instances.',
+  sessionsLabel: 'Conversations',
+  noSessions: 'This device has no conversation yet.',
+  newSession: 'New conversation',
+  cwdLabel: 'Working directory',
+  cwdHint: 'An absolute remote path, e.g. /home/me/project',
+  chatLabel: 'Conversation',
+  emptyChat: 'Pick a conversation, or start one.',
+  promptPlaceholder: 'Message the remote agent… (Enter sends, Shift+Enter adds a line)',
+  send: 'Send',
+  sending: 'Sending…',
+  stop: 'Stop',
+  sourceLog: 'History from the remote log',
+  sourceLive: 'Only messages seen since opening',
+  running: 'running',
+  idle: 'idle',
   advanced: 'Advanced',
   fieldIdentity: 'Identity file',
   fieldJump: 'Jump host (-J)',
@@ -244,6 +282,27 @@ const CSS = `
 .ri-foot { display:flex; flex-wrap:wrap; gap:8px; justify-content:space-between; }
 .ri-store code { font-family:var(--dsw-font-mono); }
 @media (prefers-reduced-motion: reduce) { .ri-page *, .ri-page *::before, .ri-page *::after { transition:none !important; animation:none !important; } }
+.ri-toolbar { position: relative; display: inline-flex; }
+.ri-panel { position: fixed; z-index: 60; width: min(560px, calc(100vw - 24px)); max-height: min(72vh, 760px); display: flex; flex-direction: column; gap: 10px; padding: 14px; box-sizing: border-box; background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-lg); box-shadow: var(--dsw-elevation-panel); color: var(--dsw-alias-label-primary); }
+.ri-panelbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ri-panelhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ri-panelhead strong { font-size: 13px; }
+.ri-select { font: inherit; font-size: 12px; padding: 5px 8px; border-radius: var(--dsw-radius-md); border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-base); color: inherit; }
+.ri-textarea { font: inherit; font-size: 12px; padding: 7px 9px; border-radius: var(--dsw-radius-md); border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-base); color: inherit; resize: vertical; min-height: 60px; width: 100%; box-sizing: border-box; }
+.ri-sessions { display: flex; flex-direction: column; gap: 4px; max-height: 132px; overflow: auto; }
+.ri-session { display: flex; flex-direction: column; gap: 2px; text-align: left; font: inherit; font-size: 12px; padding: 6px 8px; border-radius: var(--dsw-radius-md); border: 1px solid transparent; background: transparent; color: inherit; cursor: pointer; }
+.ri-session:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.ri-session[aria-pressed='true'] { border-color: var(--dsw-alias-brand-primary); }
+.ri-chat { flex: 1; min-height: 120px; overflow: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }
+.ri-msg { max-width: 92%; padding: 6px 9px; border-radius: var(--dsw-radius-md); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ri-msg-user { align-self: flex-end; background: var(--dsw-alias-bg-layer-2); }
+.ri-msg-assistant { align-self: flex-start; background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-l1); }
+.ri-msg-thought { align-self: flex-start; color: var(--dsw-alias-label-tertiary); font-style: italic; }
+.ri-msg-tool { align-self: flex-start; font-family: var(--dsw-font-mono); font-size: 11px; color: var(--dsw-alias-label-secondary); }
+.ri-msg-notice { align-self: flex-start; font-size: 11px; color: var(--dsw-alias-state-warn-primary); }
+.ri-compose { display: flex; flex-direction: column; gap: 6px; }
+.ri-composebar { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
+@media (prefers-reduced-motion: reduce) { .ri-toolbar *, .ri-panel * { transition: none !important; animation: none !important; } }
 `
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -599,6 +658,316 @@ function RemoteInstancesSection({ t, api }: SectionProps): ReactElement {
   )
 }
 
+const TOOLBAR_STYLE_ID = '@kaus-io/dsh-remote-instance/RemoteToolbar.css'
+
+/** 远端会话摘要。 / One remote conversation summary. */
+interface RemoteSessionView {
+  readonly sessionId: string
+  readonly cwd: string
+  readonly title?: string
+  readonly updatedAt?: string
+}
+
+/** 一条历史消息。 / One history message. */
+interface HistoryMessageView {
+  readonly role: 'user' | 'assistant' | 'thought' | 'tool' | 'notice'
+  readonly text: string
+  readonly status?: string
+}
+
+/** 历史读取结果。 / A history read. */
+interface HistoryView {
+  readonly source: 'log' | 'live'
+  readonly messages: readonly HistoryMessageView[]
+  readonly running: boolean
+  readonly note?: string
+  readonly title?: string
+  readonly cwd?: string
+}
+
+function asSessions(value: unknown): RemoteSessionView[] {
+  const record = isRecord(value) ? value : {}
+  const rows = Array.isArray(record.sessions) ? record.sessions : []
+  const sessions: RemoteSessionView[] = []
+  for (const row of rows) {
+    if (!isRecord(row)) continue
+    const sessionId = textOf(row.sessionId)
+    if (!sessionId) continue
+    sessions.push({
+      sessionId,
+      cwd: textOf(row.cwd) ?? '',
+      ...(textOf(row.title) === undefined ? {} : { title: textOf(row.title) }),
+      ...(textOf(row.updatedAt) === undefined ? {} : { updatedAt: textOf(row.updatedAt) }),
+    })
+  }
+  return sessions
+}
+
+function asHistory(value: unknown): HistoryView {
+  const record = isRecord(value) ? value : {}
+  const rows = Array.isArray(record.messages) ? record.messages : []
+  const messages: HistoryMessageView[] = []
+  for (const row of rows) {
+    if (!isRecord(row)) continue
+    const role = row.role
+    if (role !== 'user' && role !== 'assistant' && role !== 'thought' && role !== 'tool' && role !== 'notice') continue
+    const body = textOf(row.text)
+    if (!body) continue
+    messages.push({ role, text: body, ...(textOf(row.status) === undefined ? {} : { status: textOf(row.status) }) })
+  }
+  return {
+    source: record.source === 'log' ? 'log' : 'live',
+    messages,
+    running: record.running === true,
+    ...(textOf(record.note) === undefined ? {} : { note: textOf(record.note) }),
+    ...(textOf(record.title) === undefined ? {} : { title: textOf(record.title) }),
+    ...(textOf(record.cwd) === undefined ? {} : { cwd: textOf(record.cwd) }),
+  }
+}
+
+function shortCwd(path: string): string {
+  return path.length > 60 ? `…${path.slice(-58)}` : path
+}
+
+/** 会话卡片上的「远程」入口：设备 → 会话 → 对话。 / The session-header remote entry: device → conversation → chat. */
+function RemoteToolbar({ sessionId = '', t, api }: SectionProps & { readonly sessionId?: string }): ReactElement {
+  const [open, setOpen] = useState(false)
+  const [instances, setInstances] = useState<readonly InstanceView[]>([])
+  const [device, setDevice] = useState('')
+  const [sessions, setSessions] = useState<readonly RemoteSessionView[]>([])
+  const [current, setCurrent] = useState('')
+  const [history, setHistory] = useState<HistoryView | null>(null)
+  const [cwd, setCwd] = useState('')
+  const [prompt, setPrompt] = useState('')
+  const [busy, setBusy] = useState('')
+  const [error, setError] = useState('')
+  const [rect, setRect] = useState<{ top: number; right: number } | null>(null)
+  const anchorRef = useRef<HTMLButtonElement | null>(null)
+  const tRef = useRef(t)
+  tRef.current = t
+  const apiRef = useRef(api)
+  apiRef.current = api
+  const chatRef = useRef<HTMLDivElement | null>(null)
+
+  const loadInstances = useCallback(async (): Promise<void> => {
+    try {
+      const snapshot = asInstances(await apiRef.current.read({ action: 'instances' }, sessionId))
+      setInstances(snapshot.instances)
+      setDevice(value => value || snapshot.instances[0]?.name || '')
+    } catch (failure) {
+      setError(messageOf(failure))
+    }
+  }, [sessionId])
+
+  const loadSessions = useCallback(async (name: string): Promise<void> => {
+    if (!name) return
+    try {
+      const rows = asSessions(await apiRef.current.read({ action: 'sessions', name }, sessionId))
+      setSessions(rows)
+      setCurrent(value => (rows.some(row => row.sessionId === value) ? value : rows[0]?.sessionId ?? ''))
+    } catch (failure) {
+      setError(messageOf(failure))
+    }
+  }, [sessionId])
+
+  const loadHistory = useCallback(async (name: string, remoteSession: string, refresh: boolean): Promise<void> => {
+    if (!name || !remoteSession) return
+    try {
+      setHistory(asHistory(await apiRef.current.read({ action: 'history', name, sessionId: remoteSession, refresh }, sessionId)))
+    } catch (failure) {
+      setError(messageOf(failure))
+    }
+  }, [sessionId])
+
+  // 打开面板时定位到按钮下方，并夹在视口内。 / Anchor the panel under the button, clamped to the viewport.
+  useEffect(() => {
+    if (!open) return undefined
+    const place = (): void => {
+      const box = anchorRef.current?.getBoundingClientRect()
+      if (!box) return
+      setRect({ top: Math.max(8, Math.min(box.bottom + 6, window.innerHeight - 420)), right: Math.max(8, Math.min(window.innerWidth - box.right, window.innerWidth - 320)) })
+    }
+    place()
+    window.addEventListener('resize', place)
+    window.addEventListener('scroll', place, true)
+    return () => {
+      window.removeEventListener('resize', place)
+      window.removeEventListener('scroll', place, true)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return undefined
+    void loadInstances()
+    return undefined
+  }, [open, loadInstances])
+
+  useEffect(() => {
+    if (!open || !device) return undefined
+    void loadSessions(device)
+    return undefined
+  }, [open, device, loadSessions])
+
+  // 选中会话时读一次带刷新的历史，之后只轮询增量。 / Read fresh on selection, then poll.
+  useEffect(() => {
+    if (!open || !device || !current) return undefined
+    void loadHistory(device, current, true)
+    const timer = window.setInterval(() => { void loadHistory(device, current, false) }, 2500)
+    return () => window.clearInterval(timer)
+  }, [open, device, current, loadHistory])
+
+  useEffect(() => {
+    const node = chatRef.current
+    if (node) node.scrollTop = node.scrollHeight
+  }, [history])
+
+  useEffect(() => {
+    if (!open) return undefined
+    const onKey = (event: KeyboardEvent): void => { if (event.key === 'Escape') setOpen(false) }
+    const onDown = (event: MouseEvent): void => {
+      const target = event.target as Node | null
+      if (!target) return
+      if (anchorRef.current?.contains(target)) return
+      if ((event.target as Element | null)?.closest?.('.ri-panel')) return
+      setOpen(false)
+    }
+    document.addEventListener('keydown', onKey)
+    document.addEventListener('mousedown', onDown)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.removeEventListener('mousedown', onDown)
+    }
+  }, [open])
+
+  const act = async (label: string, args: Record<string, unknown>): Promise<unknown | undefined> => {
+    setBusy(label)
+    setError('')
+    try {
+      return await apiRef.current.act(args, sessionId)
+    } catch (failure) {
+      setError(messageOf(failure))
+      return undefined
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const send = async (): Promise<void> => {
+    const body = prompt.trim()
+    if (!body || !device || !current) return
+    const done = await act('send', { action: 'send', name: device, sessionId: current, prompt: body, wait: false })
+    if (done === undefined) return
+    setPrompt('')
+    await loadHistory(device, current, true)
+  }
+
+  const stop = async (): Promise<void> => {
+    if (!device || !current) return
+    await act('stop', { action: 'stop', name: device, sessionId: current })
+    await loadHistory(device, current, true)
+  }
+
+  const create = async (): Promise<void> => {
+    if (!device) return
+    const value = await act('new', { action: 'new', name: device, ...(cwd.trim() ? { cwd: cwd.trim() } : {}), ...(prompt.trim() ? { prompt: prompt.trim(), wait: false } : {}) })
+    if (!isRecord(value) || typeof value.sessionId !== 'string') return
+    setPrompt('')
+    setCurrent(value.sessionId)
+    await loadSessions(device)
+    await loadHistory(device, value.sessionId, true)
+  }
+
+  const footer = history?.note ? <p className="ri-hint">{history.note}</p> : null
+
+  return (
+    <span className="ri-toolbar">
+      <button
+        ref={anchorRef}
+        type="button"
+        className="ri-button"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={() => setOpen(value => !value)}
+      >
+        {t('remote')}
+        {history?.running ? ' •' : ''}
+      </button>
+      {open && rect ? (
+        <div className="ri-panel" style={{ top: rect.top, right: rect.right }} role="dialog" aria-label={t('panelTitle')}>
+          <style id={TOOLBAR_STYLE_ID}>{CSS}</style>
+          <div className="ri-panelhead">
+            <strong>{t('panelTitle')}</strong>
+            <button type="button" className="ri-button" onClick={() => setOpen(false)}>{t('close')}</button>
+          </div>
+          {error ? <p className="ri-error" role="alert">{error}</p> : null}
+          {instances.length === 0 ? <p className="ri-muted">{t('noDevice')}</p> : null}
+          <div className="ri-panelbar">
+            <label className="ri-hint" htmlFor="ri-device">{t('deviceLabel')}</label>
+            <select id="ri-device" className="ri-select" value={device} onChange={event => { setDevice(event.target.value); setCurrent(''); setHistory(null) }}>
+              {instances.map(instance => <option key={instance.name} value={instance.name}>{instance.name} · {instance.target}{instance.platform ? ` · ${instance.platform}` : ''}</option>)}
+            </select>
+            <button type="button" className="ri-button" onClick={() => { void loadInstances(); if (device) void loadSessions(device) }}>{t('refresh')}</button>
+          </div>
+          <div className="ri-sessions" aria-label={t('sessionsLabel')}>
+            {sessions.length === 0 ? <span className="ri-hint">{t('noSessions')}</span> : sessions.map(row => (
+              <button
+                key={row.sessionId}
+                type="button"
+                className="ri-session"
+                aria-pressed={row.sessionId === current}
+                onClick={() => setCurrent(row.sessionId)}
+              >
+                <span>{row.title ?? row.sessionId}</span>
+                <span className="ri-hint">{shortCwd(row.cwd)}{row.updatedAt ? ` · ${row.updatedAt}` : ''}</span>
+              </button>
+            ))}
+          </div>
+          <div className="ri-chat" ref={chatRef} aria-label={t('chatLabel')}>
+            {history === null || history.messages.length === 0
+              ? <span className="ri-hint">{t('emptyChat')}</span>
+              : history.messages.map((message, index) => (
+                <div
+                  key={`${message.role}-${index}`}
+                  className={`ri-msg ${message.role === 'user' ? 'ri-msg-user' : message.role === 'assistant' ? 'ri-msg-assistant' : message.role === 'thought' ? 'ri-msg-thought' : message.role === 'tool' ? 'ri-msg-tool' : 'ri-msg-notice'}`}
+                >
+                  {message.text}
+                  {message.status ? ` · ${message.status}` : ''}
+                </div>
+              ))}
+          </div>
+          {footer}
+          <div className="ri-compose">
+            <textarea
+              className="ri-textarea"
+              value={prompt}
+              placeholder={t('promptPlaceholder')}
+              aria-label={t('chatLabel')}
+              onChange={event => setPrompt(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault()
+                  void send()
+                }
+              }}
+            />
+            <div className="ri-panelbar">
+              <input className="ri-input" style={{ flex: 1 }} value={cwd} placeholder={t('cwdHint')} aria-label={t('cwdLabel')} onChange={event => setCwd(event.target.value)} />
+              <button type="button" className="ri-button" disabled={Boolean(busy) || !device} onClick={() => void create()}>{t('newSession')}</button>
+            </div>
+            <div className="ri-composebar">
+              <span className="ri-hint">{history?.running ? t('running') : t('idle')}{history ? ` · ${history.source === 'log' ? t('sourceLog') : t('sourceLive')}` : ''}</span>
+              <button type="button" className="ri-button" disabled={Boolean(busy) || !history?.running} onClick={() => void stop()}>{t('stop')}</button>
+              <button type="button" className="ri-button ri-primary" disabled={Boolean(busy) || !prompt.trim() || !current} onClick={() => void send()}>
+                {busy === 'send' ? t('sending') : t('send')}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </span>
+  )
+}
+
 export const inject = ['slots', 'locale']
 
 export function apply(ctx: ClientContext): void {
@@ -606,8 +975,8 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => {
     const t = ctx.locale.bind(NS)
     const api: PanelApi = {
-      read: args => postJson(OBSERVE_PATH, { 'x-ri-observe': '1' }, { args }),
-      act: args => postJson(ACTION_PATH, { 'x-ri-action': '1' }, { args }),
+      read: (args, sessionId) => postJson(OBSERVE_PATH, { 'x-ri-observe': '1' }, sessionId ? { args, sessionId } : { args }),
+      act: (args, sessionId) => postJson(ACTION_PATH, { 'x-ri-action': '1' }, sessionId ? { args, sessionId } : { args }),
     }
     ctx.slots.inject('settings.section', () => ctx.slots.register({
       name: 'settings.section',
@@ -617,5 +986,12 @@ export function apply(ctx: ClientContext): void {
       locale: NS,
       inject: () => ({ api }),
     }, RemoteInstancesSection))
+    ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+      name: 'conversation.session.header.utilities',
+      id: 'remote-instance-toolbar',
+      order: 40,
+      locale: NS,
+      inject: () => ({ api }),
+    }, RemoteToolbar))
   }, 'remote-instance.settings')
 }

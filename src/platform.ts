@@ -125,6 +125,33 @@ export function windowsTaskCommand(instance: CommandInstance, sessionId?: string
   return powershellCommand(windowsTaskScript(instance, sessionId))
 }
 
+/** POSIX 上的 ACP 服务命令：常驻 stdio。 / The ACP stdio server command on POSIX. */
+export function posixAcpCommand(instance: CommandInstance): string {
+  const steps: string[] = []
+  if (instance.cwd) steps.push(`cd -- ${shellQuote(instance.cwd)}`)
+  steps.push(`exec ${shellQuote(instance.dsh)} ${shellQuote('--profile')} ${shellQuote('acp')}`)
+  const script = steps.join(' && ')
+  return instance.shell === '' ? script : `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`
+}
+
+/** Windows 上的 ACP 服务命令。 / The ACP stdio server command on Windows. */
+export function windowsAcpCommand(instance: CommandInstance): string {
+  const lines = [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    '[Console]::OutputEncoding = [Text.Encoding]::UTF8',
+  ]
+  if (instance.cwd) lines.push(`Set-Location -LiteralPath ${psQuote(instance.cwd)}`)
+  lines.push(`& ${[instance.dsh, '--profile', 'acp'].map(psQuote).join(' ')}`)
+  lines.push('exit $LASTEXITCODE')
+  return powershellCommand(lines.join('\n'))
+}
+
+/** 按平台构造 ACP 启动命令。 / Build the ACP launch command for one platform. */
+export function acpCommand(instance: CommandInstance, platform: Platform): string {
+  return platform === 'windows' ? windowsAcpCommand(instance) : posixAcpCommand(instance)
+}
+
 /** 按平台构造任务命令。 / Build the task command for one platform. */
 export function taskCommand(instance: CommandInstance, platform: Platform, sessionId?: string): string {
   return platform === 'windows' ? windowsTaskCommand(instance, sessionId) : posixTaskCommand(instance, sessionId)

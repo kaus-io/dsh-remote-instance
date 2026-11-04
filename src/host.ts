@@ -9,6 +9,8 @@ import { RemoteInstanceService } from './service.js'
 import { parameters, READ_ACTIONS, TOOL_DESCRIPTION } from './tool.js'
 import type { HostContext } from './contracts.js'
 
+export { AcpClient, AcpConnectionError } from './acp.js'
+export { decompressFrames, historyCommand, parseSessionLog, MAX_LOG_BYTES } from './history.js'
 export { createTaskParser } from './headless.js'
 export { ACTION_PATH, createActionHandler, createObserveHandler, OBSERVE_PATH, sameLoopbackOrigin } from './http.js'
 export { InstanceStore, instanceSummary, displayTarget, NAME_PATTERN, restoreInstance, validateInstance } from './instances.js'

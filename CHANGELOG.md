@@ -1,5 +1,13 @@
 # 更新日志
 
+## 1.0.0-alpha04
+
+- 会话控制：新增 ACP（`dsh --profile acp`）通道——`sessions` 列出远端 DSH 自己的会话，`new` 在指定目录新开，`history` 读历史，`send` 发消息并流式接收 `session/update`，`stop`/`close` 停止或关闭。
+- 历史回放：受限读取远端 `$DSH_HOME/sessions/**` 的 zstd 多帧日志（8 MB 上限），本地解压后解析 v4 JSONL 成消息；读不到日志时退回「打开之后」的消息。
+- UI：会话卡片新增「远程」入口（设备 → 会话 → 对话，支持发送、停止、新会话）；设置页继续负责设备管理，新增密码、认证方式与平台徽章。
+- `instances` 返回本机身份（`hostname` / `platform`）与每台设备的 `note`，agent 能分辨本机与远程、以及哪台接着开发板。
+- ACP 权限请求允许一次并写入对话记录；ACP 连接按设备缓存，失败后下次调用重连，卸载时关闭。
+
 ## 1.0.0-alpha03
 
 - 新增密码认证：`add` 接受 `password`，保存到 `$DSH_HOME/remote-instances.secrets.json`（`0600`），只经 `SSH_ASKPASS` 交给 ssh 子进程，绝不进 `argv`、日志、作业输出或工具结果。

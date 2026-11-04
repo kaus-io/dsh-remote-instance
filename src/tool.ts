@@ -5,11 +5,11 @@
  */
 
 /** 全部动作；只读动作不索取审批。 / Every action; read-only actions need no approval. */
-export const ACTIONS = ['instances', 'add', 'remove', 'probe', 'ask', 'jobs', 'status', 'cancel'] as const
+export const ACTIONS = ['instances', 'add', 'remove', 'probe', 'ask', 'jobs', 'status', 'cancel', 'sessions', 'new', 'history', 'send', 'stop', 'close'] as const
 /** 只读动作。 / Read-only actions. */
-export const READ_ACTIONS = new Set<string>(['instances', 'probe', 'jobs', 'status'])
+export const READ_ACTIONS = new Set<string>(['instances', 'probe', 'jobs', 'status', 'sessions', 'history'])
 /** 会改动本地清单或触发远程执行的动作。 / Actions that mutate the list or start remote work. */
-export const NATIVE_ACTIONS = new Set<string>(['add', 'remove', 'ask'])
+export const NATIVE_ACTIONS = new Set<string>(['add', 'remove', 'ask', 'new', 'send', 'stop', 'close'])
 
 export type Action = (typeof ACTIONS)[number]
 
@@ -17,7 +17,7 @@ const FIELDS: Record<string, { readonly type: 'string' | 'integer' | 'boolean'; 
   action: {
     type: 'string',
     enum: ACTIONS,
-    description: 'instances lists registered devices with their last probe; add/remove edit the device list; probe checks ssh reachability, remote dsh version, and the profile directory; ask dispatches a task to the remote DSH agent as a background job; jobs lists this session’s remote jobs; status/cancel use a jobId.',
+    description: 'instances lists registered devices (plus this host’s identity and each device’s purpose note); add/remove edit the device list; probe checks ssh reachability, remote dsh version, profile directory, and platform; ask dispatches a one-shot task as a background job (jobs/status/cancel track it); sessions lists the remote DSH’s own conversations via ACP; new opens one in a directory; history reads what has been said since this plugin opened it; send posts a message into one; stop cancels its running turn; close ends it.',
   },
   name: { type: 'string', description: 'Device name from instances, e.g. laptop. Required by remove/probe/ask; `add` creates or replaces it and derives a name from the host when omitted.' },
   host: { type: 'string', description: 'For add: remote host name, IP address, or ssh config alias. Never a URL.' },
@@ -34,6 +34,8 @@ const FIELDS: Record<string, { readonly type: 'string' | 'integer' | 'boolean'; 
   prompt: { type: 'string', description: 'For ask: the task text handed to the remote DSH agent. It travels over stdin, never inside a shell command line.' },
   sessionId: { type: 'string', description: 'For ask: continue an existing remote dsh session id instead of starting a fresh one.' },
   jobId: { type: 'string', description: 'For status/cancel: the jobId returned by ask or listed by jobs.' },
+  wait: { type: 'boolean', description: 'For send: wait for the remote turn to finish before returning (default true). The Settings panel and the session toolbar always poll instead.' },
+  refresh: { type: 'boolean', description: 'For history: read the remote session log again instead of using the cached copy.' },
   from: { type: 'integer', description: 'For status: output byte cursor; default 0. Continue with output.next.' },
 }
 

@@ -1,20 +1,25 @@
 /**
- * 设置面板使用的两个 HTTP 端点：读清单与显式用户操作。两者都只接受已认证浏览器 Peer，并校验同源 Origin。
- * The two HTTP endpoints the Settings panel uses: read the list, and run an
- * explicit user action. Both accept only the authenticated browser peer and
- * check the same-origin `Origin`.
+ * 设置面板与会话工具栏共用的两个 HTTP 端点：读（清单、作业、输出）与显式用户操作（增删设备、探测、派发、取消）。
+ * 两者都只接受已认证浏览器 Peer，并校验同源 Origin；会话相关的动作必须带 `sessionId`。
+ *
+ * The two HTTP endpoints shared by the Settings panel and the session toolbar:
+ * reads (devices, jobs, output) and explicit user actions (add/remove/probe,
+ * dispatch, cancel). Both accept only the authenticated browser peer and check
+ * the same-origin `Origin`; session-bound actions must carry a `sessionId`.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { RemoteInstanceService } from './service.js'
 
-/** 只读清单端点。 / The read-only list endpoint. */
+/** 只读端点。 / The read-only endpoint. */
 export const OBSERVE_PATH = '/remote-instance/observe'
 /** 显式用户操作端点。 / The explicit user-action endpoint. */
 export const ACTION_PATH = '/remote-instance/action'
 /** 只读端点允许的动作。 / Actions the read-only endpoint allows. */
-export const UI_READ_ACTIONS = new Set(['instances'])
-/** 操作端点允许的动作；探测也在这里，因为它可能写入 known_hosts 与探测缓存。 / Actions the action endpoint allows; probe sits here because it may write known_hosts and the probe cache. */
-export const UI_ACTION_ACTIONS = new Set(['add', 'remove', 'probe'])
+export const UI_READ_ACTIONS = new Set(['instances', 'jobs', 'status', 'sessions', 'history'])
+/** 操作端点允许的动作。 / Actions the action endpoint allows. */
+export const UI_ACTION_ACTIONS = new Set(['add', 'remove', 'probe', 'ask', 'cancel', 'new', 'send', 'stop', 'close'])
+/** 必须绑定会话的动作。 / Actions that need a session. */
+export const SESSION_ACTIONS = new Set(['jobs', 'status', 'ask', 'cancel'])
 const BODY_LIMIT = 65_536
 
 function sendJson(res: ServerResponse, status: number, value: unknown): undefined {
@@ -98,7 +103,13 @@ export function sameLoopbackOrigin(origin: string | undefined, expected: string)
   }
 }
 
-function envelope(raw: string): Record<string, unknown> {
+/** 请求包：可选的会话身份加动作参数。 / Envelope: an optional session identity plus the action arguments. */
+interface Envelope {
+  readonly sessionId?: string
+  readonly args: Record<string, unknown>
+}
+
+function envelope(raw: string): Envelope {
   let request: unknown
   try {
     request = JSON.parse(raw)
@@ -106,12 +117,27 @@ function envelope(raw: string): Record<string, unknown> {
     throw new Error('Invalid remote instance JSON')
   }
   if (!request || typeof request !== 'object' || Array.isArray(request)) throw new Error('Invalid remote instance request')
-  const args = (request as { args?: unknown }).args
+  const source = request as { sessionId?: unknown; args?: unknown }
+  if (source.sessionId !== undefined && (typeof source.sessionId !== 'string' || !source.sessionId || source.sessionId.length > 256)) {
+    throw new Error('Invalid session id')
+  }
+  const args = source.args
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('The request needs an args object')
-  return args as Record<string, unknown>
+  return {
+    ...(source.sessionId === undefined ? {} : { sessionId: source.sessionId }),
+    args: args as Record<string, unknown>,
+  }
 }
 
-/** 只读清单端点处理器。 / Handler for the read-only list endpoint. */
+/** 解析并校验会话身份；会话动作没有可用会话时直接拒绝。 / Resolve the session; a session action without one is refused. */
+function sessionOf(service: RemoteInstanceService, request: Envelope) {
+  if (request.sessionId === undefined) return undefined
+  const agent = service.ctx.agents.get(request.sessionId)
+  if (!agent) throw Object.assign(new Error('Unknown session'), { status: 404 })
+  return agent
+}
+
+/** 只读端点处理器。 / Handler for the read-only endpoint. */
 export function createObserveHandler(service: RemoteInstanceService, originOf: () => string) {
   return async function observe(req: IncomingMessage, res: ServerResponse): Promise<undefined> {
     const controller = new AbortController()
@@ -123,13 +149,16 @@ export function createObserveHandler(service: RemoteInstanceService, originOf: (
       if (req.headers['x-ri-observe'] !== '1') throw new Error('Missing remote instance observation header')
       const origin = originOf()
       if (origin && !sameLoopbackOrigin(req.headers.origin, origin)) throw new Error('Foreign origin')
-      const args = envelope(await readBody(req, BODY_LIMIT, controller.signal))
-      if (!UI_READ_ACTIONS.has(String(args.action))) throw new Error('This remote instance observation is not read-only')
-      const value = await service.execute(args, { source: 'ui', signal: controller.signal })
+      const request = envelope(await readBody(req, BODY_LIMIT, controller.signal))
+      if (!UI_READ_ACTIONS.has(String(request.args.action))) throw new Error('This remote instance observation is not read-only')
+      const agent = sessionOf(service, request)
+      if (SESSION_ACTIONS.has(String(request.args.action)) && agent === undefined) throw new Error('This remote instance observation needs a session')
+      const value = await service.execute(request.args, { source: 'ui', signal: controller.signal, ...(agent === undefined ? {} : { agent }) })
       return sendJson(res, 200, { ok: true, value })
     } catch (error) {
       if (res.writableEnded || res.destroyed) return undefined
-      return sendJson(res, 400, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4_000) })
+      const status = typeof (error as { status?: unknown }).status === 'number' ? (error as { status: number }).status : 400
+      return sendJson(res, status, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4_000) })
     }
   }
 }
@@ -148,13 +177,16 @@ export function createActionHandler(service: RemoteInstanceService, originOf: ()
       if (!req.headers.origin) throw new Error('Missing remote instance action origin')
       const origin = originOf()
       if (origin && !sameLoopbackOrigin(req.headers.origin, origin)) throw new Error('Foreign origin')
-      const args = envelope(await readBody(req, BODY_LIMIT, controller.signal))
-      if (!UI_ACTION_ACTIONS.has(String(args.action))) throw new Error('This action is not available from the Settings panel')
-      const value = await service.execute(args, { source: 'ui', signal: controller.signal })
+      const request = envelope(await readBody(req, BODY_LIMIT, controller.signal))
+      if (!UI_ACTION_ACTIONS.has(String(request.args.action))) throw new Error('This action is not available from the Settings panel')
+      const agent = sessionOf(service, request)
+      if (SESSION_ACTIONS.has(String(request.args.action)) && agent === undefined) throw new Error('This action needs a session')
+      const value = await service.execute(request.args, { source: 'ui', signal: controller.signal, ...(agent === undefined ? {} : { agent }) })
       return sendJson(res, 200, { ok: true, value })
     } catch (error) {
       if (res.writableEnded || res.destroyed) return undefined
-      return sendJson(res, 400, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4_000) })
+      const status = typeof (error as { status?: unknown }).status === 'number' ? (error as { status: number }).status : 400
+      return sendJson(res, status, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4_000) })
     }
   }
 }

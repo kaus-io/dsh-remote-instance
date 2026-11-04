@@ -8,19 +8,24 @@
  * enters the list, a result, or a log.
  */
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { AcpClient } from './acp.js'
+import type { AcpSessionClient, AcpTransport, AcpUpdate } from './acp.js'
 import { createTaskParser } from './headless.js'
 import { InstanceStore, instanceSummary, validateInstance } from './instances.js'
 import type { ProbeRecord, RemoteInstance, StoreSnapshot } from './instances.js'
-import { probeCommand, taskCommand } from './platform.js'
+import { acpCommand, probeCommand, taskCommand } from './platform.js'
+import { decompressFrames, historyCommand, parseSessionLog } from './history.js'
+import type { HistoryMessage, HistoryParse } from './history.js'
 import type { Platform } from './platform.js'
 import { createRunner } from './runner.js'
 import type { Runner } from './runner.js'
 import { secretsPathFor, SecretStore, assertSecret } from './secrets.js'
+import { StringDecoder } from 'node:string_decoder'
 import { displayPath } from './settings.js'
 import type { ServiceSettings } from './settings.js'
-import { ASKPASS_SCRIPT, askpassEnv, parseProbeOutput, sshArgv, sshTargetOf } from './shell.js'
+import { ASKPASS_SCRIPT, askpassEnv, parseProbeOutput, shellQuote, sshArgv, sshTargetOf } from './shell.js'
 import type { ProbeFacts } from './shell.js'
 import { approvalSubject, NATIVE_ACTIONS, validateRequest } from './tool.js'
 import type { AgentLike, HostContext, JobChunk, SubprocessHandle } from './contracts.js'
@@ -48,6 +53,29 @@ export interface ProbeResult {
   readonly message?: string
   readonly stderr?: string
   readonly elapsedMs: number
+}
+
+/** 远端的 ACP 连接工厂；测试注入替身。 / Factory for a remote ACP link; tests inject a double. */
+export type AcpFactory = (instance: RemoteInstance) => Promise<AcpSessionClient>
+
+/** 一条远程会话消息。 / One message of a remote conversation. */
+export interface TranscriptMessage {
+  readonly role: 'user' | 'assistant' | 'thought' | 'tool' | 'notice'
+  readonly text: string
+  readonly at: number
+  readonly status?: string
+  readonly id?: string
+}
+
+/** 本插件打开过的远程会话。 / A remote conversation this plugin has opened. */
+interface Transcript {
+  readonly instance: string
+  readonly sessionId: string
+  readonly cwd: string
+  title?: string
+  running: boolean
+  stopReason?: string
+  readonly messages: TranscriptMessage[]
 }
 
 /** 作业上下文，供 `jobs` 列表还原作业来源。 / Job context letting the `jobs` list explain each job. */
@@ -120,15 +148,20 @@ export class RemoteInstanceService {
   private seeded = false
   private askpassDirectory?: string
   private askpassPath?: string
+  private readonly acpFactory: AcpFactory | undefined
+  private readonly links = new Map<string, Promise<AcpSessionClient>>()
+  private readonly transcripts = new Map<string, Transcript>()
+  private readonly logCache = new Map<string, { at: number; parse: HistoryParse }>()
 
   constructor(
     readonly ctx: HostContext,
     readonly settings: ServiceSettings,
-    overrides: { readonly runner?: Runner; readonly store?: InstanceStore; readonly secrets?: SecretStore } = {},
+    overrides: { readonly runner?: Runner; readonly store?: InstanceStore; readonly secrets?: SecretStore; readonly acp?: AcpFactory } = {},
   ) {
     this.store = overrides.store ?? new InstanceStore({ file: settings.storeFile })
     this.secrets = overrides.secrets ?? new SecretStore(secretsPathFor(settings.storeFile))
     this.runner = overrides.runner ?? createRunner(ctx.subprocess, { active: this.active })
+    this.acpFactory = overrides.acp
   }
 
   /** 设备清单文件路径。 / The device-list path. */
@@ -159,13 +192,25 @@ export class RemoteInstanceService {
         return this.status(args, this.requireAgent(options.agent))
       case 'cancel':
         return this.cancel(args, this.requireAgent(options.agent))
+      case 'sessions':
+        return this.remoteSessions(args)
+      case 'new':
+        return this.newRemoteSession(args, options)
+      case 'history':
+        return this.history(args)
+      case 'send':
+        return this.sendMessage(args, options)
+      case 'stop':
+        return this.stopSession(args)
+      case 'close':
+        return this.closeSession(args)
       default:
         throw new Error('Unknown remote instance action')
     }
   }
 
   /** 已登记的设备及其最近探测结论。 / Registered devices with their last probe. */
-  async list(): Promise<{ store: string; instances: ReturnType<typeof instanceSummary>[]; skipped?: readonly string[] }> {
+  async list(): Promise<{ store: string; local: { hostname: string; platform: 'posix' | 'windows' }; instances: ReturnType<typeof instanceSummary>[]; skipped?: readonly string[] }> {
     const snapshot = await this.load()
     const passwords = await this.secrets.load()
     const summaries = [...snapshot.instances.values()]
@@ -173,6 +218,7 @@ export class RemoteInstanceService {
       .map(instance => instanceSummary(this.withAuth(instance, passwords.has(instance.name))))
     return {
       store: this.storeDisplayPath,
+      local: { hostname: hostname(), platform: process.platform === 'win32' ? 'windows' : 'posix' },
       instances: summaries,
       ...(snapshot.skipped.length === 0 ? {} : { skipped: snapshot.skipped }),
     }
@@ -398,11 +444,289 @@ export class RemoteInstanceService {
       try { this.ctx.jobs.kill(id, owner, 'Remote instance plugin unloaded') } catch { /* Agent disposal may have removed it already. / Agent 释放可能已移除。 */ }
     }
     for (const child of this.active) child.terminate()
+    const links = [...this.links.values()]
+    this.links.clear()
     await Promise.allSettled([...this.pending, ...[...this.active].map(child => child.waitForExit())])
+    await Promise.allSettled(links.map(async creation => { try { const client = await creation; await client.dispose() } catch { /* the link never opened / 连接未建立。 */ } }))
+    this.transcripts.clear()
     if (this.askpassDirectory !== undefined) await rm(this.askpassDirectory, { recursive: true, force: true })
     this.results.clear()
     this.ownedJobs.clear()
     this.contexts.clear()
+  }
+
+  /** 远端 DSH 自己的会话（ACP `session/list`）。 / The remote DSH's own conversations. */
+  async remoteSessions(args: Record<string, unknown>): Promise<{ instance: string; cwd?: string; sessions: readonly unknown[] }> {
+    const instance = await this.findInstance(requireString(args.name, 'name'))
+    const cwd = typeof args.cwd === 'string' && args.cwd ? args.cwd : undefined
+    const client = await this.linkFor(instance)
+    const sessions = await client.listSessions(cwd)
+    return { instance: instance.name, ...(cwd === undefined ? {} : { cwd }), sessions }
+  }
+
+  /** 在远端目录里开一个新会话。 / Open a fresh conversation in a remote directory. */
+  async newRemoteSession(args: Record<string, unknown>, options: ExecuteOptions): Promise<Record<string, unknown>> {
+    const instance = await this.findInstance(requireString(args.name, 'name'))
+    const cwd = typeof args.cwd === 'string' && args.cwd ? args.cwd : instance.cwd
+    if (!cwd) throw new Error('cwd is required to open a remote session')
+    await this.authorize(args, options)
+    const client = await this.linkFor(instance)
+    const sessionId = await client.newSession(cwd)
+    this.transcriptFor(instance, sessionId, cwd)
+    const prompt = typeof args.prompt === 'string' ? args.prompt : ''
+    if (!prompt.trim()) return { instance: instance.name, sessionId, cwd, status: 'idle' }
+    if (prompt.length > MAX_PROMPT) throw new Error(`prompt is too large (max ${MAX_PROMPT} characters)`)
+    const wait = args.wait !== false
+    const turn = await this.runTurn(instance, client, sessionId, prompt, wait)
+    return { instance: instance.name, sessionId, cwd, status: wait ? 'completed' : 'running', ...(turn === undefined ? {} : { stopReason: turn.stopReason }) }
+  }
+
+  /**
+   * 远端会话历史：优先读远端日志（zstd + JSONL v4）并解析，读不到时退回本插件打开后收到的消息。
+   * Remote history: read and parse the remote zstd/JSONL log first, and fall back
+   * to what this plugin has seen since it opened the session.
+   */
+  async history(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const instance = await this.findInstance(requireString(args.name, 'name'))
+    const sessionId = requireString(args.sessionId, 'sessionId')
+    const key = this.transcriptKey(instance.name, sessionId)
+    const transcript = this.transcripts.get(key)
+    const cached = this.logCache.get(key)
+    const refresh = args.refresh === true || cached === undefined || Date.now() - cached.at > 10_000
+    let parsed: HistoryParse | undefined = cached?.parse
+    let source: 'log' | 'live' = parsed === undefined ? 'live' : 'log'
+    let note: string | undefined
+    if (refresh) {
+      try {
+        const base64 = await this.fetchSessionLog(instance, sessionId)
+        if (base64) {
+          parsed = parseSessionLog(decompressFrames(Buffer.from(base64, 'base64')))
+          this.logCache.set(key, { at: Date.now(), parse: parsed })
+          source = 'log'
+        } else {
+          note = '没有找到远端会话日志；这里只有本插件打开该会话之后收到的消息。 / No remote session log was found; only messages seen since this plugin opened it are shown.'
+        }
+      } catch (error) {
+        note = `读取远端历史失败：${safeMessage(error)}。仅显示本插件打开后收到的消息。 / Reading the remote history failed; only live messages are shown.`
+      }
+    }
+    const messages: readonly HistoryMessage[] = source === 'log' && parsed !== undefined ? parsed.messages : (transcript?.messages ?? [])
+    return {
+      instance: instance.name,
+      sessionId,
+      source,
+      ...(parsed?.cwd === undefined ? {} : { cwd: parsed.cwd }),
+      ...(transcript?.title === undefined ? {} : { title: transcript.title }),
+      running: transcript?.running ?? false,
+      ...(transcript?.stopReason === undefined ? {} : { stopReason: transcript.stopReason }),
+      messages,
+      ...(note === undefined ? {} : { note }),
+    }
+  }
+
+  /** 读取远端会话日志的 base64；命令固定、只读。 / Read the remote session log as base64 with a fixed, read-only command. */
+  private async fetchSessionLog(instance: RemoteInstance, sessionId: string): Promise<string> {
+    const platform: Platform = instance.platform ?? 'posix'
+    const raw = historyCommand(platform, undefined, sessionId)
+    const command = platform === 'windows' || instance.shell === '' ? raw : `${shellQuote(instance.shell)} -lc ${shellQuote(raw)}`
+    const result = await this.exec(instance, command, { signal: this.lifetime.signal, timeoutMs: 60_000 })
+    return result.stdout.replace(/\s+/g, '')
+  }
+
+  /** 往远端会话里发一条消息。 / Post one message into a remote conversation. */
+  async sendMessage(args: Record<string, unknown>, options: ExecuteOptions): Promise<Record<string, unknown>> {
+    const instance = await this.findInstance(requireString(args.name, 'name'))
+    const sessionId = requireString(args.sessionId, 'sessionId')
+    const prompt = typeof args.prompt === 'string' ? args.prompt : ''
+    if (!prompt.trim()) throw new Error('prompt is required')
+    if (prompt.length > MAX_PROMPT) throw new Error(`prompt is too large (max ${MAX_PROMPT} characters)`)
+    await this.authorize(args, options)
+    const client = await this.linkFor(instance)
+    const wait = args.wait !== false
+    const turn = await this.runTurn(instance, client, sessionId, prompt, wait)
+    const transcript = this.transcriptFor(instance, sessionId)
+    return {
+      instance: instance.name,
+      sessionId,
+      status: wait ? 'completed' : 'running',
+      ...(turn === undefined ? {} : { stopReason: turn.stopReason }),
+      messages: transcript.messages.slice(-6),
+    }
+  }
+
+  /** 取消远端会话当前回合。 / Cancel the running turn of a remote conversation. */
+  async stopSession(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const instance = await this.findInstance(requireString(args.name, 'name'))
+    const sessionId = requireString(args.sessionId, 'sessionId')
+    const client = await this.linkFor(instance)
+    await client.cancel(sessionId)
+    const transcript = this.transcripts.get(this.transcriptKey(instance.name, sessionId))
+    if (transcript) transcript.running = false
+    return { instance: instance.name, sessionId, status: 'cancelled' }
+  }
+
+  /** 关闭远端会话并丢弃本插件保存的对话。 / Close a remote conversation and drop what this plugin kept. */
+  async closeSession(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const instance = await this.findInstance(requireString(args.name, 'name'))
+    const sessionId = requireString(args.sessionId, 'sessionId')
+    const client = await this.linkFor(instance)
+    await client.closeSession(sessionId)
+    this.transcripts.delete(this.transcriptKey(instance.name, sessionId))
+    return { instance: instance.name, sessionId, status: 'closed' }
+  }
+
+  /** 取得（或建立）一台设备的 ACP 连接；失败后下次调用会重连。 / Get or open the instance ACP link; a failure is retried next call. */
+  private async linkFor(instance: RemoteInstance): Promise<AcpSessionClient> {
+    const existing = this.links.get(instance.name)
+    if (existing) return existing
+    const factory = this.acpFactory ?? ((target: RemoteInstance) => this.spawnAcp(target))
+    const creation = factory(instance)
+    this.links.set(instance.name, creation)
+    void creation.catch(() => {
+      if (this.links.get(instance.name) === creation) this.links.delete(instance.name)
+    })
+    return creation
+  }
+
+  /** 用 ssh 拉起远端 `dsh --profile acp`。 / Start the remote `dsh --profile acp` over ssh. */
+  private async spawnAcp(instance: RemoteInstance): Promise<AcpSessionClient> {
+    const auth = instance.auth ?? 'key'
+    const argv = sshArgv(sshTargetOf(instance), acpCommand(instance, instance.platform ?? 'posix'), { connectTimeoutMs: this.settings.connectTimeoutMs, auth })
+    let env: Record<string, string> | undefined
+    if (auth === 'password') {
+      const password = await this.secrets.get(instance.name)
+      if (password === undefined) throw new Error(`remote instance "${instance.name}" needs a password; re-add it with the password field`)
+      env = { ...askpassEnv(await this.askpassHelper()), DSH_REMOTE_PASSWORD: password }
+    }
+    const child = this.ctx.subprocess.spawn({
+      argv,
+      cwd: process.cwd(),
+      graceMs: 3_000,
+      stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
+      ...(env === undefined ? {} : { env }),
+    })
+    const stdin = child.stdin
+    if (!stdin) {
+      child.terminate()
+      throw new Error('the ssh client exposed no stdin for ACP')
+    }
+    this.active.add(child)
+    void child.done.finally(() => this.active.delete(child)).catch(() => undefined)
+    let stderr = ''
+    void (async () => {
+      try {
+        for await (const chunk of child.stderr ?? []) stderr = (stderr + Buffer.from(chunk).toString('utf8')).slice(-4_000)
+      } catch { /* the pipe closed / 管道已关闭。 */ }
+    })()
+    const transport: AcpTransport = {
+      stdin: { write: text => { stdin.write(text) }, end: () => { try { stdin.end() } catch { /* ignore / 忽略。 */ } } },
+      lines: linesOf(child.stdout),
+      closed: child.done.then(() => undefined, () => undefined),
+      terminate: () => child.terminate(),
+    }
+    try {
+      return await AcpClient.connect(transport, {
+        requestTimeoutMs: 30_000,
+        onUpdate: event => this.applyUpdate(instance, event),
+        // 远端 ACP 没有别的审批来源；一次性允许并写进对话，用户能在面板里看到。 / ACP has no other approval source; allow once and record it in the transcript.
+        onPermission: request => {
+          const transcript = this.transcriptFor(instance, request.sessionId)
+          transcript.messages.push({ role: 'notice', text: `已自动允许远端工具：${request.title}`, at: Date.now() })
+          return 'allow'
+        },
+        onWarning: message => this.ctx.logger?.warn(`remote-instance ${instance.name}: ${message}${stderr ? ` (${stderr.slice(-400)})` : ''}`),
+      })
+    } catch (error) {
+      child.terminate()
+      this.active.delete(child)
+      throw new Error(`cannot open the ACP link to ${instance.name}: ${safeMessage(error)}${stderr ? ` (${stderr.slice(-600)})` : ''}`)
+    }
+  }
+
+  private transcriptKey(instance: string, sessionId: string): string {
+    return `${instance}\u0000${sessionId}`
+  }
+
+  private transcriptFor(instance: RemoteInstance, sessionId: string, cwd?: string): Transcript {
+    const key = this.transcriptKey(instance.name, sessionId)
+    const existing = this.transcripts.get(key)
+    if (existing) return existing
+    const created: Transcript = { instance: instance.name, sessionId, cwd: cwd ?? instance.cwd ?? '', running: false, messages: [] }
+    this.transcripts.set(key, created)
+    return created
+  }
+
+  /** 把 ACP 更新折叠成交互记录。 / Fold one ACP update into the transcript. */
+  private applyUpdate(instance: RemoteInstance, event: AcpUpdate): void {
+    const kind = typeof event.update.sessionUpdate === 'string' ? event.update.sessionUpdate : ''
+    if (!kind) return
+    const transcript = this.transcriptFor(instance, event.sessionId)
+    const contentText = (value: unknown): string => {
+      if (!value || typeof value !== 'object') return ''
+      const text = (value as { text?: unknown }).text
+      return typeof text === 'string' ? text : ''
+    }
+    const append = (role: TranscriptMessage['role'], text: string, extra: { id?: string; status?: string } = {}): void => {
+      if (!text) return
+      const last = transcript.messages[transcript.messages.length - 1]
+      if (last && last.role === role && last.id === undefined && extra.id === undefined && role !== 'tool') {
+        transcript.messages[transcript.messages.length - 1] = { ...last, text: (last.text + text).slice(-200_000) }
+        return
+      }
+      transcript.messages.push({ role, text: text.slice(0, 200_000), at: Date.now(), ...(extra.id === undefined ? {} : { id: extra.id }), ...(extra.status === undefined ? {} : { status: extra.status }) })
+      if (transcript.messages.length > 240) transcript.messages.splice(0, 40)
+    }
+    switch (kind) {
+      case 'agent_message_chunk':
+        append('assistant', contentText(event.update.content))
+        break
+      case 'agent_thought_chunk':
+        append('thought', contentText(event.update.content))
+        break
+      case 'tool_call': {
+        const id = typeof event.update.toolCallId === 'string' ? event.update.toolCallId : undefined
+        const title = typeof event.update.title === 'string' ? event.update.title : 'tool'
+        append('tool', title, { ...(id === undefined ? {} : { id }), ...(typeof event.update.status === 'string' ? { status: event.update.status } : {}) })
+        break
+      }
+      case 'tool_call_update': {
+        const id = typeof event.update.toolCallId === 'string' ? event.update.toolCallId : undefined
+        if (id === undefined) break
+        for (let index = transcript.messages.length - 1; index >= 0; index -= 1) {
+          const message = transcript.messages[index]
+          if (!message || message.id !== id) continue
+          transcript.messages[index] = { ...message, ...(typeof event.update.status === 'string' ? { status: event.update.status } : {}) }
+          break
+        }
+        break
+      }
+      case 'session_info_update':
+        if (typeof event.update.title === 'string' && event.update.title) transcript.title = event.update.title
+        break
+      default:
+        break
+    }
+  }
+
+  /** 发一轮对话；`wait` 为 false 时只保证已提交。 / Run one turn; without `wait` it only confirms submission. */
+  private async runTurn(instance: RemoteInstance, client: AcpSessionClient, sessionId: string, prompt: string, wait: boolean): Promise<{ stopReason: string } | undefined> {
+    const transcript = this.transcriptFor(instance, sessionId)
+    transcript.messages.push({ role: 'user', text: prompt, at: Date.now() })
+    transcript.running = true
+    const turn = client.prompt(sessionId, prompt).then(result => {
+      transcript.stopReason = result.stopReason
+      return result
+    }).catch(error => {
+      transcript.messages.push({ role: 'notice', text: safeMessage(error), at: Date.now() })
+      throw error
+    }).finally(() => {
+      transcript.running = false
+    })
+    if (!wait) {
+      void turn.catch(() => undefined)
+      return undefined
+    }
+    return turn
   }
 
   private requireAgent(agent: AgentLike | undefined): AgentLike {
@@ -535,4 +859,22 @@ export class RemoteInstanceService {
     })
     if (outcome !== 'allowed-once') throw new Error(`Remote instance operation not authorized (${outcome})`)
   }
+}
+
+/** 把原始字节流切成行，供 JSON-RPC 解码。 / Split the raw byte stream into lines for JSON-RPC. */
+async function* linesOf(stream: AsyncIterable<Uint8Array> | undefined): AsyncIterable<string> {
+  if (!stream) return
+  const decoder = new StringDecoder('utf8')
+  let buffer = ''
+  for await (const chunk of stream) {
+    buffer += decoder.write(Buffer.from(chunk))
+    let index = buffer.indexOf('\n')
+    while (index >= 0) {
+      yield buffer.slice(0, index)
+      buffer = buffer.slice(index + 1)
+      index = buffer.indexOf('\n')
+    }
+  }
+  buffer += decoder.end()
+  if (buffer) yield buffer
 }

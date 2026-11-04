@@ -17,10 +17,12 @@
 
 远端支持 **Linux / macOS / Windows**：POSIX 系统走登录 shell，Windows 走 PowerShell，平台由 `probe` 自动识别并记住。任务正文只走 `stdin`；密码只交给 `SSH_ASKPASS`，不进 `argv`、日志、作业输出或工具结果。
 
+会话卡片上的「远程」入口把一台设备当成可操作的实例：列出它自己的会话、读历史、直接对话、停止当前回合，也能在指定目录新开一个会话。
+
 ### 安装
 
 ```sh
-dsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha03
+dsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha04
 ```
 
 本地开发用 `link:` 指向仓库目录，两种来源互斥；`patchReload: startup` 的 profile 需要重启 `dsh web` 才会加载新 bundle。
@@ -32,6 +34,12 @@ dsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha03
 - `probe`：只读检查远端系统、`dsh` 版本、`$DSH_HOME` 与目标 `profile` 目录，同时确定平台。
 - `ask`：把 prompt 交给远端 `dsh --profile headless --json`，返回 `jobId`；`jobs` / `status` / `cancel` 跟踪或停止。
 - `add` / `remove`：维护设备清单，`remove` 会同时删掉保存的密码。
+- `sessions`：列出这台远端 DSH 自己的会话（标题 / 工作目录 / 最近活动）。
+- `new`：在某个远端目录新开一个会话，可带首条消息。
+- `history`：读远端会话历史；能读到远端日志时来自日志，否则只显示打开之后的消息。
+- `send` / `stop` / `close`：发消息、停当前回合、关闭会话。
+
+远端会话走 ACP（`dsh --profile acp`）：`session/list`、`session/new`、`session/resume`、`session/prompt`、`session/update`、`session/cancel`、`session/close`。ACP 没有 `session/load`，所以历史回放读的是远端 `$DSH_HOME/sessions/**` 的日志（zstd + JSONL v4，上限 8 MB）。
 
 远端要有能跑起来的 `dsh`：Linux/macOS 在登录 shell 的 `PATH` 里；Windows 在 PowerShell 里可执行（路径含空格就填绝对路径）。`headless` profile 默认不读 GUI 保存的登录凭据，远端要有 `DEEPSEEK_API_KEY`。
 
@@ -41,6 +49,8 @@ dsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha03
 - 首次连接接受并锁定主机指纹（`StrictHostKeyChecking=accept-new`），指纹变化仍然失败。
 - 密码认证要求运行 DSH 的机器有 POSIX `ssh` 客户端（`SSH_ASKPASS`）；Windows 宿主请改用密钥。
 - 通过工具传 `password` 会被记进会话日志，优先用设置面板填写。
+- 远端 agent 的工具权限请求由 ACP 客户端答复：当前策略是允许一次，并在对话里留一条「已自动允许」的记录。
+- 历史读取是固定只读命令 + 会话 id 白名单 + 8 MB 压缩上限，不会变成任意文件读取。
 
 ### 参与贡献
 

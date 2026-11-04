@@ -1,8 +1,9 @@
 // src/http.ts
 var OBSERVE_PATH = "/remote-instance/observe";
 var ACTION_PATH = "/remote-instance/action";
-var UI_READ_ACTIONS = /* @__PURE__ */ new Set(["instances"]);
-var UI_ACTION_ACTIONS = /* @__PURE__ */ new Set(["add", "remove", "probe"]);
+var UI_READ_ACTIONS = /* @__PURE__ */ new Set(["instances", "jobs", "status", "sessions", "history"]);
+var UI_ACTION_ACTIONS = /* @__PURE__ */ new Set(["add", "remove", "probe", "ask", "cancel", "new", "send", "stop", "close"]);
+var SESSION_ACTIONS = /* @__PURE__ */ new Set(["jobs", "status", "ask", "cancel"]);
 var BODY_LIMIT = 65536;
 function sendJson(res, status, value) {
   if (res.writableEnded || res.destroyed) return void 0;
@@ -88,9 +89,22 @@ function envelope(raw) {
     throw new Error("Invalid remote instance JSON");
   }
   if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("Invalid remote instance request");
-  const args = request.args;
+  const source = request;
+  if (source.sessionId !== void 0 && (typeof source.sessionId !== "string" || !source.sessionId || source.sessionId.length > 256)) {
+    throw new Error("Invalid session id");
+  }
+  const args = source.args;
   if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("The request needs an args object");
-  return args;
+  return {
+    ...source.sessionId === void 0 ? {} : { sessionId: source.sessionId },
+    args
+  };
+}
+function sessionOf(service, request) {
+  if (request.sessionId === void 0) return void 0;
+  const agent = service.ctx.agents.get(request.sessionId);
+  if (!agent) throw Object.assign(new Error("Unknown session"), { status: 404 });
+  return agent;
 }
 function createObserveHandler(service, originOf) {
   return async function observe(req, res) {
@@ -104,13 +118,16 @@ function createObserveHandler(service, originOf) {
       if (req.headers["x-ri-observe"] !== "1") throw new Error("Missing remote instance observation header");
       const origin = originOf();
       if (origin && !sameLoopbackOrigin(req.headers.origin, origin)) throw new Error("Foreign origin");
-      const args = envelope(await readBody(req, BODY_LIMIT, controller.signal));
-      if (!UI_READ_ACTIONS.has(String(args.action))) throw new Error("This remote instance observation is not read-only");
-      const value = await service.execute(args, { source: "ui", signal: controller.signal });
+      const request = envelope(await readBody(req, BODY_LIMIT, controller.signal));
+      if (!UI_READ_ACTIONS.has(String(request.args.action))) throw new Error("This remote instance observation is not read-only");
+      const agent = sessionOf(service, request);
+      if (SESSION_ACTIONS.has(String(request.args.action)) && agent === void 0) throw new Error("This remote instance observation needs a session");
+      const value = await service.execute(request.args, { source: "ui", signal: controller.signal, ...agent === void 0 ? {} : { agent } });
       return sendJson(res, 200, { ok: true, value });
     } catch (error) {
       if (res.writableEnded || res.destroyed) return void 0;
-      return sendJson(res, 400, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4e3) });
+      const status = typeof error.status === "number" ? error.status : 400;
+      return sendJson(res, status, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4e3) });
     }
   };
 }
@@ -128,13 +145,16 @@ function createActionHandler(service, originOf) {
       if (!req.headers.origin) throw new Error("Missing remote instance action origin");
       const origin = originOf();
       if (origin && !sameLoopbackOrigin(req.headers.origin, origin)) throw new Error("Foreign origin");
-      const args = envelope(await readBody(req, BODY_LIMIT, controller.signal));
-      if (!UI_ACTION_ACTIONS.has(String(args.action))) throw new Error("This action is not available from the Settings panel");
-      const value = await service.execute(args, { source: "ui", signal: controller.signal });
+      const request = envelope(await readBody(req, BODY_LIMIT, controller.signal));
+      if (!UI_ACTION_ACTIONS.has(String(request.args.action))) throw new Error("This action is not available from the Settings panel");
+      const agent = sessionOf(service, request);
+      if (SESSION_ACTIONS.has(String(request.args.action)) && agent === void 0) throw new Error("This action needs a session");
+      const value = await service.execute(request.args, { source: "ui", signal: controller.signal, ...agent === void 0 ? {} : { agent } });
       return sendJson(res, 200, { ok: true, value });
     } catch (error) {
       if (res.writableEnded || res.destroyed) return void 0;
-      return sendJson(res, 400, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4e3) });
+      const status = typeof error.status === "number" ? error.status : 400;
+      return sendJson(res, status, { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 4e3) });
     }
   };
 }
@@ -409,8 +429,230 @@ function resolveSettings(config) {
 
 // src/service.ts
 import { chmod as chmod2, mkdtemp, rm, writeFile as writeFile3 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join as join2 } from "node:path";
+
+// src/acp.ts
+var CLIENT_NAME = "dsh-remote-instance";
+var CLIENT_VERSION = "1.0.0";
+var AcpConnectionError = class extends Error {
+};
+var AcpClient = class _AcpClient {
+  constructor(transport, options) {
+    this.transport = transport;
+    this.options = options;
+  }
+  transport;
+  options;
+  nextId = 1;
+  pending = /* @__PURE__ */ new Map();
+  live = /* @__PURE__ */ new Set();
+  disposed = false;
+  /** 建立连接并完成 `initialize` 握手。 / Connect and complete the `initialize` handshake. */
+  static async connect(transport, options = {}) {
+    const client = new _AcpClient(transport, options);
+    client.read();
+    await client.request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      clientInfo: { name: CLIENT_NAME, version: CLIENT_VERSION }
+    });
+    return client;
+  }
+  async listSessions(cwd) {
+    const result = await this.request("session/list", cwd === void 0 ? {} : { cwd });
+    const rows = Array.isArray(result?.sessions) ? result.sessions : [];
+    const sessions = [];
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const source = row;
+      if (typeof source.sessionId !== "string" || !source.sessionId) continue;
+      if (typeof source.cwd !== "string" || !source.cwd) continue;
+      sessions.push({
+        sessionId: source.sessionId,
+        cwd: source.cwd,
+        ...typeof source.title === "string" && source.title ? { title: source.title } : {},
+        ...typeof source.updatedAt === "string" && source.updatedAt ? { updatedAt: source.updatedAt } : {}
+      });
+    }
+    return sessions;
+  }
+  async newSession(cwd) {
+    const result = await this.request("session/new", { cwd, mcpServers: [] });
+    if (typeof result?.sessionId !== "string" || !result.sessionId) throw new AcpConnectionError("session/new returned no session id");
+    this.live.add(result.sessionId);
+    return result.sessionId;
+  }
+  async resumeSession(sessionId, cwd) {
+    if (this.live.has(sessionId)) return;
+    await this.request("session/resume", { sessionId, ...cwd === void 0 ? {} : { cwd }, mcpServers: [] });
+    this.live.add(sessionId);
+  }
+  async prompt(sessionId, text, promptOptions = {}) {
+    await this.resumeSession(sessionId);
+    const result = await this.request(
+      "session/prompt",
+      { sessionId, prompt: [{ type: "text", text }] },
+      { timeoutMs: 0, signal: promptOptions.signal }
+    );
+    return { stopReason: typeof result?.stopReason === "string" ? result.stopReason : "end_turn" };
+  }
+  async cancel(sessionId) {
+    this.notify("session/cancel", { sessionId });
+  }
+  async closeSession(sessionId) {
+    try {
+      await this.request("session/close", { sessionId });
+    } finally {
+      this.live.delete(sessionId);
+    }
+  }
+  async dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const [id, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      entry.reject(new AcpConnectionError("the ACP connection closed"));
+      this.pending.delete(id);
+    }
+    try {
+      this.transport.stdin.end();
+    } catch {
+    }
+    try {
+      this.transport.terminate();
+    } catch {
+    }
+    await Promise.race([this.transport.closed, new Promise((resolve) => setTimeout(resolve, 3e3))]).catch(() => void 0);
+  }
+  write(message) {
+    if (this.disposed) throw new AcpConnectionError("the ACP connection closed");
+    this.transport.stdin.write(`${JSON.stringify(message)}
+`);
+  }
+  notify(method, params) {
+    this.write({ jsonrpc: "2.0", method, params });
+  }
+  request(method, params, options = {}) {
+    if (this.disposed) return Promise.reject(new AcpConnectionError("the ACP connection closed"));
+    const id = this.nextId++;
+    const timeoutMs = options.timeoutMs ?? this.options.requestTimeoutMs ?? 3e4;
+    return new Promise((resolve, reject) => {
+      const settle = () => {
+        clearTimeout(entry.timer);
+        this.pending.delete(id);
+        options.signal?.removeEventListener("abort", abort);
+      };
+      const entry = {
+        resolve: (value) => {
+          settle();
+          resolve(value);
+        },
+        reject: (error) => {
+          settle();
+          reject(error);
+        },
+        timer: setTimeout(() => entry.reject(new AcpConnectionError(`ACP request timed out: ${method}`)), timeoutMs)
+      };
+      const abort = () => {
+        entry.reject(new AcpConnectionError(`ACP request cancelled: ${method}`));
+        try {
+          this.notify("session/cancel", params);
+        } catch {
+        }
+      };
+      if (timeoutMs > 0) entry.timer.unref?.();
+      else clearTimeout(entry.timer);
+      this.pending.set(id, entry);
+      if (options.signal?.aborted) {
+        abort();
+        return;
+      }
+      options.signal?.addEventListener("abort", abort, { once: true });
+      try {
+        this.write({ jsonrpc: "2.0", id, method, params });
+      } catch (error) {
+        entry.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+  read() {
+    void (async () => {
+      try {
+        for await (const line of this.transport.lines) {
+          if (this.disposed) break;
+          const text = line.trim();
+          if (!text) continue;
+          let message;
+          try {
+            message = JSON.parse(text);
+          } catch {
+            this.options.onWarning?.("ignored an ACP line that was not JSON");
+            continue;
+          }
+          if (!message || typeof message !== "object") continue;
+          this.dispatch(message);
+        }
+      } catch (error) {
+        if (!this.disposed) this.options.onWarning?.(`ACP stream ended: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        if (!this.disposed) {
+          for (const [, entry] of this.pending) entry.reject(new AcpConnectionError("the ACP connection closed"));
+          this.pending.clear();
+        }
+      }
+    })();
+  }
+  dispatch(message) {
+    const id = typeof message.id === "number" ? message.id : void 0;
+    const method = typeof message.method === "string" ? message.method : void 0;
+    if (id !== void 0 && method === void 0) {
+      const entry = this.pending.get(id);
+      if (!entry) return;
+      if (message.error && typeof message.error === "object") {
+        const failure = message.error;
+        entry.reject(new AcpConnectionError(typeof failure.message === "string" ? failure.message : `ACP error ${String(failure.code ?? "unknown")}`));
+      } else {
+        entry.resolve(message.result);
+      }
+      return;
+    }
+    if (method === void 0) return;
+    if (id !== void 0) {
+      this.answer(id, method, message.params);
+      return;
+    }
+    this.notification(method, message.params);
+  }
+  answer(id, method, params) {
+    if (method !== "session/request_permission") {
+      this.write({ jsonrpc: "2.0", id, error: { code: -32601, message: `unsupported agent request: ${method}` } });
+      return;
+    }
+    const request = params ?? {};
+    const sessionId = typeof request.sessionId === "string" ? request.sessionId : "";
+    const toolCall = request.toolCall ?? {};
+    const title = typeof toolCall.title === "string" ? toolCall.title : "tool call";
+    const options = Array.isArray(request.options) ? request.options : [];
+    const kinds = options.map((option) => option && typeof option === "object" ? String(option.kind ?? "") : "");
+    const decision = this.options.onPermission?.({ sessionId, title, options: kinds }) ?? "deny";
+    const wanted = decision === "allow" ? ["allow_once", "allow_always"] : ["reject_once", "reject_always"];
+    const index = kinds.findIndex((kind) => wanted.includes(kind));
+    const chosen = index >= 0 ? options[index] : void 0;
+    const optionId = typeof chosen?.optionId === "string" ? chosen.optionId : void 0;
+    this.write({
+      jsonrpc: "2.0",
+      id,
+      result: optionId === void 0 ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }
+    });
+  }
+  notification(method, params) {
+    if (method !== "session/update") return;
+    const request = params ?? {};
+    if (typeof request.sessionId !== "string" || !request.update || typeof request.update !== "object") return;
+    this.options.onUpdate?.({ sessionId: request.sessionId, update: request.update });
+  }
+};
 
 // src/headless.ts
 var MAX_ANSWER = 2e5;
@@ -696,11 +938,181 @@ function windowsTaskScript(instance, sessionId) {
 function windowsTaskCommand(instance, sessionId) {
   return powershellCommand(windowsTaskScript(instance, sessionId));
 }
+function posixAcpCommand(instance) {
+  const steps = [];
+  if (instance.cwd) steps.push(`cd -- ${shellQuote(instance.cwd)}`);
+  steps.push(`exec ${shellQuote(instance.dsh)} ${shellQuote("--profile")} ${shellQuote("acp")}`);
+  const script = steps.join(" && ");
+  return instance.shell === "" ? script : `${shellQuote(instance.shell)} -lc ${shellQuote(script)}`;
+}
+function windowsAcpCommand(instance) {
+  const lines = [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8"
+  ];
+  if (instance.cwd) lines.push(`Set-Location -LiteralPath ${psQuote(instance.cwd)}`);
+  lines.push(`& ${[instance.dsh, "--profile", "acp"].map(psQuote).join(" ")}`);
+  lines.push("exit $LASTEXITCODE");
+  return powershellCommand(lines.join("\n"));
+}
+function acpCommand(instance, platform) {
+  return platform === "windows" ? windowsAcpCommand(instance) : posixAcpCommand(instance);
+}
 function taskCommand(instance, platform, sessionId) {
   return platform === "windows" ? windowsTaskCommand(instance, sessionId) : posixTaskCommand(instance, sessionId);
 }
 function probeCommand(instance, platform) {
   return platform === "windows" ? windowsProbeCommand(instance) : posixProbeCommand(instance);
+}
+
+// src/history.ts
+import { zstdDecompressSync } from "node:zlib";
+var MAX_LOG_BYTES = 8 * 1024 * 1024;
+var MAX_MESSAGES = 240;
+var MAX_TEXT = 2e4;
+var MAGIC = [40, 181, 47, 253];
+function decompressFrames(buffer) {
+  if (buffer.length === 0) return "";
+  const starts = [];
+  for (let index = 0; index + 4 <= buffer.length; index += 1) {
+    if (buffer[index] === MAGIC[0] && buffer[index + 1] === MAGIC[1] && buffer[index + 2] === MAGIC[2] && buffer[index + 3] === MAGIC[3]) starts.push(index);
+  }
+  if (starts.length === 0) throw new Error("the session log has no zstd frame");
+  let text = "";
+  for (let index = 0; index < starts.length; index += 1) {
+    const from = starts[index];
+    const to = starts[index + 1] ?? buffer.length;
+    try {
+      text += zstdDecompressSync(buffer.subarray(from, to)).toString("utf8");
+    } catch {
+    }
+  }
+  return text;
+}
+function textOfBlocks(blocks, kinds) {
+  if (!Array.isArray(blocks)) return "";
+  const parts = [];
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    const source = block;
+    if (typeof source.type !== "string" || !kinds.includes(source.type)) continue;
+    if (typeof source.text === "string" && source.text) parts.push(source.text);
+  }
+  return parts.join("");
+}
+function brief2(value, limit = 200) {
+  let text;
+  try {
+    text = typeof value === "string" ? value : JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  text = (text ?? "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit)}\u2026` : text;
+}
+function parseSessionLog(text) {
+  const messages = [];
+  let sessionId;
+  let cwd;
+  let createdAt;
+  let events = 0;
+  const push = (message) => {
+    if (!message.text) return;
+    const last = messages[messages.length - 1];
+    if (last && last.role === message.role && last.id === void 0 && message.id === void 0 && message.role !== "tool") {
+      messages[messages.length - 1] = { ...last, text: (last.text + message.text).slice(-MAX_TEXT) };
+      return;
+    }
+    messages.push({ ...message, text: message.text.slice(0, MAX_TEXT) });
+    if (messages.length > MAX_MESSAGES) messages.splice(0, messages.length - MAX_MESSAGES);
+  };
+  for (const line of text.split("\n")) {
+    const raw = line.trim();
+    if (!raw) continue;
+    let event;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") continue;
+      event = parsed;
+    } catch {
+      continue;
+    }
+    events += 1;
+    const data = event.data ?? {};
+    if (event.type === "session") {
+      if (typeof event.id === "string") sessionId = event.id;
+      if (typeof event.cwd === "string") cwd = event.cwd;
+      if (typeof event.createdAt === "number") createdAt = event.createdAt;
+      continue;
+    }
+    const at = typeof event.time === "number" ? event.time : void 0;
+    switch (event.type) {
+      case "user/message": {
+        const body = textOfBlocks(data.content, ["text"]);
+        push({ role: "user", text: body, ...at === void 0 ? {} : { at } });
+        break;
+      }
+      case "assistant/message": {
+        const message = data.message ?? {};
+        const body = textOfBlocks(message.content, ["text"]);
+        const thought = textOfBlocks(message.content, ["reasoning"]);
+        if (thought) push({ role: "thought", text: thought, ...at === void 0 ? {} : { at } });
+        if (body) push({ role: "assistant", text: body, ...at === void 0 ? {} : { at } });
+        break;
+      }
+      case "tool/call": {
+        const name2 = typeof data.name === "string" ? data.name : "tool";
+        const args = brief2(data.arguments);
+        push({
+          role: "tool",
+          text: `${name2}${args && args !== "{}" ? ` ${args}` : ""}`,
+          at: at ?? Date.now(),
+          ...typeof data.callId === "string" ? { id: data.callId } : {},
+          status: "called"
+        });
+        break;
+      }
+      case "tool/result": {
+        const id = typeof data.toolCallId === "string" ? data.toolCallId : void 0;
+        if (id === void 0) break;
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+          const message = messages[index];
+          if (!message || message.id !== id) continue;
+          messages[index] = { ...message, status: "done" };
+          break;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return { messages, events, ...sessionId === void 0 ? {} : { sessionId }, ...cwd === void 0 ? {} : { cwd }, ...createdAt === void 0 ? {} : { createdAt } };
+}
+function historyCommand(platform, home, sessionId, limit = MAX_LOG_BYTES) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) throw new Error("sessionId may only contain A-Za-z0-9, _ and -");
+  const base = home && home.trim() ? home.trim() : "${DSH_HOME:-$HOME/.dsh}";
+  if (platform === "windows") {
+    const script2 = [
+      "$ErrorActionPreference = 'SilentlyContinue'",
+      "$ProgressPreference = 'SilentlyContinue'",
+      "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
+      `$home = ${home && home.trim() ? psQuote(home.trim()) : `if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }`}`,
+      `$sid = ${psQuote(sessionId)}`,
+      `$dir = Get-ChildItem (Join-Path $home 'sessions') -Directory | ForEach-Object { Get-ChildItem $_.FullName -Directory } | Where-Object { $_.Name -eq $sid } | Select-Object -First 1`,
+      "if ($dir) { $chunks = @(); $size = 0; Get-ChildItem $dir.FullName -Filter *.jsonl.zstd | Sort-Object Name | ForEach-Object { if ($size -lt " + String(limit) + ") { $bytes = [IO.File]::ReadAllBytes($_.FullName); $size += $bytes.Length; $chunks += $bytes } }; if ($chunks.Count -gt 0) { [Convert]::ToBase64String([byte[]]$chunks) } }"
+    ].join("\n");
+    return `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${Buffer.from(script2, "utf16le").toString("base64")}`;
+  }
+  const homeExpr = home && home.trim() ? shellQuote(home.trim()) : '"${DSH_HOME:-$HOME/.dsh}"';
+  const script = [
+    `home=${homeExpr}`,
+    `dir=$(find "$home/sessions" -mindepth 2 -maxdepth 2 -type d -name ${shellQuote(sessionId)} 2>/dev/null | head -n 1)`,
+    '[ -n "$dir" ] || exit 0',
+    `cat "$dir"/*.jsonl.zstd 2>/dev/null | head -c ${limit} | base64 | tr -d '\\n'`
+  ].join("\n");
+  return script;
 }
 
 // src/runner.ts
@@ -850,15 +1262,18 @@ function assertSecret(value) {
   return value;
 }
 
+// src/service.ts
+import { StringDecoder as StringDecoder2 } from "node:string_decoder";
+
 // src/tool.ts
-var ACTIONS = ["instances", "add", "remove", "probe", "ask", "jobs", "status", "cancel"];
-var READ_ACTIONS = /* @__PURE__ */ new Set(["instances", "probe", "jobs", "status"]);
-var NATIVE_ACTIONS = /* @__PURE__ */ new Set(["add", "remove", "ask"]);
+var ACTIONS = ["instances", "add", "remove", "probe", "ask", "jobs", "status", "cancel", "sessions", "new", "history", "send", "stop", "close"];
+var READ_ACTIONS = /* @__PURE__ */ new Set(["instances", "probe", "jobs", "status", "sessions", "history"]);
+var NATIVE_ACTIONS = /* @__PURE__ */ new Set(["add", "remove", "ask", "new", "send", "stop", "close"]);
 var FIELDS = {
   action: {
     type: "string",
     enum: ACTIONS,
-    description: "instances lists registered devices with their last probe; add/remove edit the device list; probe checks ssh reachability, remote dsh version, and the profile directory; ask dispatches a task to the remote DSH agent as a background job; jobs lists this session\u2019s remote jobs; status/cancel use a jobId."
+    description: "instances lists registered devices (plus this host\u2019s identity and each device\u2019s purpose note); add/remove edit the device list; probe checks ssh reachability, remote dsh version, profile directory, and platform; ask dispatches a one-shot task as a background job (jobs/status/cancel track it); sessions lists the remote DSH\u2019s own conversations via ACP; new opens one in a directory; history reads what has been said since this plugin opened it; send posts a message into one; stop cancels its running turn; close ends it."
   },
   name: { type: "string", description: "Device name from instances, e.g. laptop. Required by remove/probe/ask; `add` creates or replaces it and derives a name from the host when omitted." },
   host: { type: "string", description: "For add: remote host name, IP address, or ssh config alias. Never a URL." },
@@ -875,6 +1290,8 @@ var FIELDS = {
   prompt: { type: "string", description: "For ask: the task text handed to the remote DSH agent. It travels over stdin, never inside a shell command line." },
   sessionId: { type: "string", description: "For ask: continue an existing remote dsh session id instead of starting a fresh one." },
   jobId: { type: "string", description: "For status/cancel: the jobId returned by ask or listed by jobs." },
+  wait: { type: "boolean", description: "For send: wait for the remote turn to finish before returning (default true). The Settings panel and the session toolbar always poll instead." },
+  refresh: { type: "boolean", description: "For history: read the remote session log again instead of using the cached copy." },
   from: { type: "integer", description: "For status: output byte cursor; default 0. Continue with output.next." }
 };
 var parameters = {
@@ -961,6 +1378,7 @@ var RemoteInstanceService = class {
     this.store = overrides.store ?? new InstanceStore({ file: settings.storeFile });
     this.secrets = overrides.secrets ?? new SecretStore(secretsPathFor(settings.storeFile));
     this.runner = overrides.runner ?? createRunner(ctx.subprocess, { active: this.active });
+    this.acpFactory = overrides.acp;
   }
   ctx;
   settings;
@@ -980,6 +1398,10 @@ var RemoteInstanceService = class {
   seeded = false;
   askpassDirectory;
   askpassPath;
+  acpFactory;
+  links = /* @__PURE__ */ new Map();
+  transcripts = /* @__PURE__ */ new Map();
+  logCache = /* @__PURE__ */ new Map();
   /** 设备清单文件路径。 / The device-list path. */
   get storeDisplayPath() {
     return displayPath(this.store.path);
@@ -1007,6 +1429,18 @@ var RemoteInstanceService = class {
         return this.status(args, this.requireAgent(options.agent));
       case "cancel":
         return this.cancel(args, this.requireAgent(options.agent));
+      case "sessions":
+        return this.remoteSessions(args);
+      case "new":
+        return this.newRemoteSession(args, options);
+      case "history":
+        return this.history(args);
+      case "send":
+        return this.sendMessage(args, options);
+      case "stop":
+        return this.stopSession(args);
+      case "close":
+        return this.closeSession(args);
       default:
         throw new Error("Unknown remote instance action");
     }
@@ -1018,6 +1452,7 @@ var RemoteInstanceService = class {
     const summaries = [...snapshot.instances.values()].sort((left, right) => left.name.localeCompare(right.name)).map((instance) => instanceSummary(this.withAuth(instance, passwords.has(instance.name))));
     return {
       store: this.storeDisplayPath,
+      local: { hostname: hostname(), platform: process.platform === "win32" ? "windows" : "posix" },
       instances: summaries,
       ...snapshot.skipped.length === 0 ? {} : { skipped: snapshot.skipped }
     };
@@ -1247,11 +1682,290 @@ ${message}
       }
     }
     for (const child of this.active) child.terminate();
+    const links = [...this.links.values()];
+    this.links.clear();
     await Promise.allSettled([...this.pending, ...[...this.active].map((child) => child.waitForExit())]);
+    await Promise.allSettled(links.map(async (creation) => {
+      try {
+        const client = await creation;
+        await client.dispose();
+      } catch {
+      }
+    }));
+    this.transcripts.clear();
     if (this.askpassDirectory !== void 0) await rm(this.askpassDirectory, { recursive: true, force: true });
     this.results.clear();
     this.ownedJobs.clear();
     this.contexts.clear();
+  }
+  /** 远端 DSH 自己的会话（ACP `session/list`）。 / The remote DSH's own conversations. */
+  async remoteSessions(args) {
+    const instance = await this.findInstance(requireString(args.name, "name"));
+    const cwd = typeof args.cwd === "string" && args.cwd ? args.cwd : void 0;
+    const client = await this.linkFor(instance);
+    const sessions = await client.listSessions(cwd);
+    return { instance: instance.name, ...cwd === void 0 ? {} : { cwd }, sessions };
+  }
+  /** 在远端目录里开一个新会话。 / Open a fresh conversation in a remote directory. */
+  async newRemoteSession(args, options) {
+    const instance = await this.findInstance(requireString(args.name, "name"));
+    const cwd = typeof args.cwd === "string" && args.cwd ? args.cwd : instance.cwd;
+    if (!cwd) throw new Error("cwd is required to open a remote session");
+    await this.authorize(args, options);
+    const client = await this.linkFor(instance);
+    const sessionId = await client.newSession(cwd);
+    this.transcriptFor(instance, sessionId, cwd);
+    const prompt = typeof args.prompt === "string" ? args.prompt : "";
+    if (!prompt.trim()) return { instance: instance.name, sessionId, cwd, status: "idle" };
+    if (prompt.length > MAX_PROMPT) throw new Error(`prompt is too large (max ${MAX_PROMPT} characters)`);
+    const wait = args.wait !== false;
+    const turn = await this.runTurn(instance, client, sessionId, prompt, wait);
+    return { instance: instance.name, sessionId, cwd, status: wait ? "completed" : "running", ...turn === void 0 ? {} : { stopReason: turn.stopReason } };
+  }
+  /**
+   * 远端会话历史：优先读远端日志（zstd + JSONL v4）并解析，读不到时退回本插件打开后收到的消息。
+   * Remote history: read and parse the remote zstd/JSONL log first, and fall back
+   * to what this plugin has seen since it opened the session.
+   */
+  async history(args) {
+    const instance = await this.findInstance(requireString(args.name, "name"));
+    const sessionId = requireString(args.sessionId, "sessionId");
+    const key = this.transcriptKey(instance.name, sessionId);
+    const transcript = this.transcripts.get(key);
+    const cached = this.logCache.get(key);
+    const refresh = args.refresh === true || cached === void 0 || Date.now() - cached.at > 1e4;
+    let parsed = cached?.parse;
+    let source = parsed === void 0 ? "live" : "log";
+    let note;
+    if (refresh) {
+      try {
+        const base64 = await this.fetchSessionLog(instance, sessionId);
+        if (base64) {
+          parsed = parseSessionLog(decompressFrames(Buffer.from(base64, "base64")));
+          this.logCache.set(key, { at: Date.now(), parse: parsed });
+          source = "log";
+        } else {
+          note = "\u6CA1\u6709\u627E\u5230\u8FDC\u7AEF\u4F1A\u8BDD\u65E5\u5FD7\uFF1B\u8FD9\u91CC\u53EA\u6709\u672C\u63D2\u4EF6\u6253\u5F00\u8BE5\u4F1A\u8BDD\u4E4B\u540E\u6536\u5230\u7684\u6D88\u606F\u3002 / No remote session log was found; only messages seen since this plugin opened it are shown.";
+        }
+      } catch (error) {
+        note = `\u8BFB\u53D6\u8FDC\u7AEF\u5386\u53F2\u5931\u8D25\uFF1A${safeMessage(error)}\u3002\u4EC5\u663E\u793A\u672C\u63D2\u4EF6\u6253\u5F00\u540E\u6536\u5230\u7684\u6D88\u606F\u3002 / Reading the remote history failed; only live messages are shown.`;
+      }
+    }
+    const messages = source === "log" && parsed !== void 0 ? parsed.messages : transcript?.messages ?? [];
+    return {
+      instance: instance.name,
+      sessionId,
+      source,
+      ...parsed?.cwd === void 0 ? {} : { cwd: parsed.cwd },
+      ...transcript?.title === void 0 ? {} : { title: transcript.title },
+      running: transcript?.running ?? false,
+      ...transcript?.stopReason === void 0 ? {} : { stopReason: transcript.stopReason },
+      messages,
+      ...note === void 0 ? {} : { note }
+    };
+  }
+  /** 读取远端会话日志的 base64；命令固定、只读。 / Read the remote session log as base64 with a fixed, read-only command. */
+  async fetchSessionLog(instance, sessionId) {
+    const platform = instance.platform ?? "posix";
+    const raw = historyCommand(platform, void 0, sessionId);
+    const command = platform === "windows" || instance.shell === "" ? raw : `${shellQuote(instance.shell)} -lc ${shellQuote(raw)}`;
+    const result = await this.exec(instance, command, { signal: this.lifetime.signal, timeoutMs: 6e4 });
+    return result.stdout.replace(/\s+/g, "");
+  }
+  /** 往远端会话里发一条消息。 / Post one message into a remote conversation. */
+  async sendMessage(args, options) {
+    const instance = await this.findInstance(requireString(args.name, "name"));
+    const sessionId = requireString(args.sessionId, "sessionId");
+    const prompt = typeof args.prompt === "string" ? args.prompt : "";
+    if (!prompt.trim()) throw new Error("prompt is required");
+    if (prompt.length > MAX_PROMPT) throw new Error(`prompt is too large (max ${MAX_PROMPT} characters)`);
+    await this.authorize(args, options);
+    const client = await this.linkFor(instance);
+    const wait = args.wait !== false;
+    const turn = await this.runTurn(instance, client, sessionId, prompt, wait);
+    const transcript = this.transcriptFor(instance, sessionId);
+    return {
+      instance: instance.name,
+      sessionId,
+      status: wait ? "completed" : "running",
+      ...turn === void 0 ? {} : { stopReason: turn.stopReason },
+      messages: transcript.messages.slice(-6)
+    };
+  }
+  /** 取消远端会话当前回合。 / Cancel the running turn of a remote conversation. */
+  async stopSession(args) {
+    const instance = await this.findInstance(requireString(args.name, "name"));
+    const sessionId = requireString(args.sessionId, "sessionId");
+    const client = await this.linkFor(instance);
+    await client.cancel(sessionId);
+    const transcript = this.transcripts.get(this.transcriptKey(instance.name, sessionId));
+    if (transcript) transcript.running = false;
+    return { instance: instance.name, sessionId, status: "cancelled" };
+  }
+  /** 关闭远端会话并丢弃本插件保存的对话。 / Close a remote conversation and drop what this plugin kept. */
+  async closeSession(args) {
+    const instance = await this.findInstance(requireString(args.name, "name"));
+    const sessionId = requireString(args.sessionId, "sessionId");
+    const client = await this.linkFor(instance);
+    await client.closeSession(sessionId);
+    this.transcripts.delete(this.transcriptKey(instance.name, sessionId));
+    return { instance: instance.name, sessionId, status: "closed" };
+  }
+  /** 取得（或建立）一台设备的 ACP 连接；失败后下次调用会重连。 / Get or open the instance ACP link; a failure is retried next call. */
+  async linkFor(instance) {
+    const existing = this.links.get(instance.name);
+    if (existing) return existing;
+    const factory = this.acpFactory ?? ((target) => this.spawnAcp(target));
+    const creation = factory(instance);
+    this.links.set(instance.name, creation);
+    void creation.catch(() => {
+      if (this.links.get(instance.name) === creation) this.links.delete(instance.name);
+    });
+    return creation;
+  }
+  /** 用 ssh 拉起远端 `dsh --profile acp`。 / Start the remote `dsh --profile acp` over ssh. */
+  async spawnAcp(instance) {
+    const auth = instance.auth ?? "key";
+    const argv = sshArgv(sshTargetOf(instance), acpCommand(instance, instance.platform ?? "posix"), { connectTimeoutMs: this.settings.connectTimeoutMs, auth });
+    let env;
+    if (auth === "password") {
+      const password = await this.secrets.get(instance.name);
+      if (password === void 0) throw new Error(`remote instance "${instance.name}" needs a password; re-add it with the password field`);
+      env = { ...askpassEnv(await this.askpassHelper()), DSH_REMOTE_PASSWORD: password };
+    }
+    const child = this.ctx.subprocess.spawn({
+      argv,
+      cwd: process.cwd(),
+      graceMs: 3e3,
+      stdio: { stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+      ...env === void 0 ? {} : { env }
+    });
+    const stdin = child.stdin;
+    if (!stdin) {
+      child.terminate();
+      throw new Error("the ssh client exposed no stdin for ACP");
+    }
+    this.active.add(child);
+    void child.done.finally(() => this.active.delete(child)).catch(() => void 0);
+    let stderr = "";
+    void (async () => {
+      try {
+        for await (const chunk of child.stderr ?? []) stderr = (stderr + Buffer.from(chunk).toString("utf8")).slice(-4e3);
+      } catch {
+      }
+    })();
+    const transport = {
+      stdin: { write: (text) => {
+        stdin.write(text);
+      }, end: () => {
+        try {
+          stdin.end();
+        } catch {
+        }
+      } },
+      lines: linesOf(child.stdout),
+      closed: child.done.then(() => void 0, () => void 0),
+      terminate: () => child.terminate()
+    };
+    try {
+      return await AcpClient.connect(transport, {
+        requestTimeoutMs: 3e4,
+        onUpdate: (event) => this.applyUpdate(instance, event),
+        // 远端 ACP 没有别的审批来源；一次性允许并写进对话，用户能在面板里看到。 / ACP has no other approval source; allow once and record it in the transcript.
+        onPermission: (request) => {
+          const transcript = this.transcriptFor(instance, request.sessionId);
+          transcript.messages.push({ role: "notice", text: `\u5DF2\u81EA\u52A8\u5141\u8BB8\u8FDC\u7AEF\u5DE5\u5177\uFF1A${request.title}`, at: Date.now() });
+          return "allow";
+        },
+        onWarning: (message) => this.ctx.logger?.warn(`remote-instance ${instance.name}: ${message}${stderr ? ` (${stderr.slice(-400)})` : ""}`)
+      });
+    } catch (error) {
+      child.terminate();
+      this.active.delete(child);
+      throw new Error(`cannot open the ACP link to ${instance.name}: ${safeMessage(error)}${stderr ? ` (${stderr.slice(-600)})` : ""}`);
+    }
+  }
+  transcriptKey(instance, sessionId) {
+    return `${instance}\0${sessionId}`;
+  }
+  transcriptFor(instance, sessionId, cwd) {
+    const key = this.transcriptKey(instance.name, sessionId);
+    const existing = this.transcripts.get(key);
+    if (existing) return existing;
+    const created = { instance: instance.name, sessionId, cwd: cwd ?? instance.cwd ?? "", running: false, messages: [] };
+    this.transcripts.set(key, created);
+    return created;
+  }
+  /** 把 ACP 更新折叠成交互记录。 / Fold one ACP update into the transcript. */
+  applyUpdate(instance, event) {
+    const kind = typeof event.update.sessionUpdate === "string" ? event.update.sessionUpdate : "";
+    if (!kind) return;
+    const transcript = this.transcriptFor(instance, event.sessionId);
+    const contentText = (value) => {
+      if (!value || typeof value !== "object") return "";
+      const text = value.text;
+      return typeof text === "string" ? text : "";
+    };
+    const append = (role, text, extra = {}) => {
+      if (!text) return;
+      const last = transcript.messages[transcript.messages.length - 1];
+      if (last && last.role === role && last.id === void 0 && extra.id === void 0 && role !== "tool") {
+        transcript.messages[transcript.messages.length - 1] = { ...last, text: (last.text + text).slice(-2e5) };
+        return;
+      }
+      transcript.messages.push({ role, text: text.slice(0, 2e5), at: Date.now(), ...extra.id === void 0 ? {} : { id: extra.id }, ...extra.status === void 0 ? {} : { status: extra.status } });
+      if (transcript.messages.length > 240) transcript.messages.splice(0, 40);
+    };
+    switch (kind) {
+      case "agent_message_chunk":
+        append("assistant", contentText(event.update.content));
+        break;
+      case "agent_thought_chunk":
+        append("thought", contentText(event.update.content));
+        break;
+      case "tool_call": {
+        const id = typeof event.update.toolCallId === "string" ? event.update.toolCallId : void 0;
+        const title = typeof event.update.title === "string" ? event.update.title : "tool";
+        append("tool", title, { ...id === void 0 ? {} : { id }, ...typeof event.update.status === "string" ? { status: event.update.status } : {} });
+        break;
+      }
+      case "tool_call_update": {
+        const id = typeof event.update.toolCallId === "string" ? event.update.toolCallId : void 0;
+        if (id === void 0) break;
+        for (let index = transcript.messages.length - 1; index >= 0; index -= 1) {
+          const message = transcript.messages[index];
+          if (!message || message.id !== id) continue;
+          transcript.messages[index] = { ...message, ...typeof event.update.status === "string" ? { status: event.update.status } : {} };
+          break;
+        }
+        break;
+      }
+      case "session_info_update":
+        if (typeof event.update.title === "string" && event.update.title) transcript.title = event.update.title;
+        break;
+      default:
+        break;
+    }
+  }
+  /** 发一轮对话；`wait` 为 false 时只保证已提交。 / Run one turn; without `wait` it only confirms submission. */
+  async runTurn(instance, client, sessionId, prompt, wait) {
+    const transcript = this.transcriptFor(instance, sessionId);
+    transcript.messages.push({ role: "user", text: prompt, at: Date.now() });
+    transcript.running = true;
+    const turn = client.prompt(sessionId, prompt).then((result) => {
+      transcript.stopReason = result.stopReason;
+      return result;
+    }).catch((error) => {
+      transcript.messages.push({ role: "notice", text: safeMessage(error), at: Date.now() });
+      throw error;
+    }).finally(() => {
+      transcript.running = false;
+    });
+    if (!wait) {
+      void turn.catch(() => void 0);
+      return void 0;
+    }
+    return turn;
   }
   requireAgent(agent) {
     if (!agent) throw new Error("Choose a live session first");
@@ -1368,6 +2082,22 @@ ${message}
     if (outcome !== "allowed-once") throw new Error(`Remote instance operation not authorized (${outcome})`);
   }
 };
+async function* linesOf(stream) {
+  if (!stream) return;
+  const decoder = new StringDecoder2("utf8");
+  let buffer = "";
+  for await (const chunk of stream) {
+    buffer += decoder.write(Buffer.from(chunk));
+    let index = buffer.indexOf("\n");
+    while (index >= 0) {
+      yield buffer.slice(0, index);
+      buffer = buffer.slice(index + 1);
+      index = buffer.indexOf("\n");
+    }
+  }
+  buffer += decoder.end();
+  if (buffer) yield buffer;
+}
 
 // src/host.ts
 var name = "remote-instance";
@@ -1423,7 +2153,10 @@ export {
   ACTIONS,
   ACTION_PATH,
   ASKPASS_SCRIPT,
+  AcpClient,
+  AcpConnectionError,
   InstanceStore,
+  MAX_LOG_BYTES,
   NAME_PATTERN,
   OBSERVE_PATH,
   READ_ACTIONS,
@@ -1438,13 +2171,16 @@ export {
   createObserveHandler,
   createRunner,
   createTaskParser,
+  decompressFrames,
   displayPath,
   displayTarget,
   encodePowerShell,
+  historyCommand,
   inject,
   instanceSummary,
   name,
   parseProbeOutput,
+  parseSessionLog,
   posixProbeCommand,
   posixTaskCommand,
   powershellCommand,

@@ -36,9 +36,9 @@ export interface SandboxPolicyService {
 
 /** 托管子进程的标准输入输出约定。 / Stdio dispositions accepted by the managed subprocess provider. */
 export interface SubprocessStdio {
-  readonly stdin: 'ignore' | { readonly data: string }
-  readonly stdout: 'pipe'
-  readonly stderr: 'pipe'
+  readonly stdin: 'ignore' | 'pipe' | { readonly data: string }
+  readonly stdout: 'pipe' | 'inherit'
+  readonly stderr: 'pipe' | 'inherit'
 }
 
 /** 完整指定的托管进程；provider 不补任何默认值。 / Fully specified managed process; the provider applies no defaults. */
@@ -59,6 +59,8 @@ export interface SubprocessOutcome {
 
 /** 活跃托管进程句柄。 / Live managed process handle. */
 export interface SubprocessHandle {
+  /** 子进程 stdin；仅在 `stdin: 'pipe'` 时存在。 / The child stdin, present only for `stdin: 'pipe'`. */
+  readonly stdin?: { write(chunk: string): boolean; end(): void; on(event: 'error', listener: (error: Error) => void): unknown }
   readonly stdout?: AsyncIterable<Uint8Array>
   readonly stderr?: AsyncIterable<Uint8Array>
   readonly done: Promise<SubprocessOutcome>

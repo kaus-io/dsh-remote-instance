@@ -94,7 +94,7 @@ describe('apply', () => {
     const tool = ctx.registered.tools[0]
     assert.equal(tool.name, TOOL_NAME)
     assert.equal(tool.parameters.required[0], 'action')
-    assert.deepEqual(tool.parameters.properties.action.enum, ['instances', 'add', 'remove', 'probe', 'ask', 'jobs', 'status', 'cancel'])
+    assert.deepEqual(tool.parameters.properties.action.enum, ['instances', 'add', 'remove', 'probe', 'ask', 'jobs', 'status', 'cancel', 'sessions', 'new', 'history', 'send', 'stop', 'close'])
     assert.equal(tool.parameters.additionalProperties, false)
     assert.deepEqual(ctx.registered.routes.map(route => route.path).sort(), [ACTION_PATH, OBSERVE_PATH].sort())
     assert.ok(ctx.registered.routes.every(route => route.kind === 'exact'))
@@ -173,7 +173,7 @@ describe('Settings endpoints', () => {
     assert.equal(JSON.parse(add.res.payload).value.instance.target, 'dev.lan')
     assert.equal(ctx.registered.tools.length, 0)
 
-    const denied = exchange({ headers: BROWSER_HEADERS, body: JSON.stringify({ args: { action: 'ask', name: 'dev', prompt: 'x' } }) })
+    const denied = exchange({ headers: BROWSER_HEADERS, body: JSON.stringify({ args: { action: 'jobs' } }) })
     await action(denied.req, denied.res)
     assert.equal(denied.res.status, 400)
     assert.match(JSON.parse(denied.res.payload).error, /not available from the Settings panel/)
