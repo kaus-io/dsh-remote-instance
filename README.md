@@ -36,10 +36,6 @@ dsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha01
 
 远端需要装好 `dsh` 并能免交互 `ssh`；`headless` profile 默认不读 GUI 保存的登录凭据，远端要有 `DEEPSEEK_API_KEY`（或恢复该 profile 的凭据行）。
 
-### 使用文档
-
-[传送门](docs/reference.md)。
-
 ### 参与贡献
 
 欢迎提 `Issues` 和 `PR`。报问题时带上 `dsh --version`、远端系统与 `probe` 的输出，定位会快很多。
