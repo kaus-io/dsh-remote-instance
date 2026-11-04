@@ -45,6 +45,7 @@
 - 升版本时必须同时改 README 的安装命令与 CHANGELOG 顶部条目，否则版本检查直接失败；CI 不改写版本号，版本只有 `package.json` 一个来源，顺序固定为「bump → rebuild → 更新 README/CHANGELOG → commit → 打 tag → 建 release」。
 - **CI 红过的版本不升号**：修在同一版本上重试——改代码、重新构建、重跑检查，需要时把该版本的 tag 移到修复提交。只有已经发到 npm 或用户明确要求时才 bump。
 - 移动/删除远端 tag 是改远端引用，只有用户明确要求才做；做完整理新旧指向，并说明「没发出去」的版本号是否保留。
+- **本地 + 远端验证通过前不 push、不发 npm**：单测全绿只算本地一半，还要把包装到真实远端设备、重启宿主、用真实调用走通主要路径；任何一步失败就留在本地继续改，修完重走两遍。
 - 仓库 secret `NPM_TOKEN` 必须能发布 `@kaus-io` 下的包；令牌不写进任何文件。要 provenance 时再加 `id-token: write` 与 `--provenance`。
 - 预发布绝不能发成 `latest`，否则用户默认装到 alpha；dist-tag 交给脚本推导，不要在 workflow 里手写 `--tag`。
 
