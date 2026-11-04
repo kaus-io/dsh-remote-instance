@@ -4,6 +4,14 @@
   "description": "Remote DSH instances over SSH: register another device's dsh, probe it, and dispatch tasks to its agent as parallel background jobs",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaus-io/dsh-remote-instance.git"
+  },
+  "homepage": "https://github.com/kaus-io/dsh-remote-instance#readme",
+  "bugs": {
+    "url": "https://github.com/kaus-io/dsh-remote-instance/issues"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",
