@@ -43,6 +43,21 @@ describe('shellQuote', () => {
   })
 })
 
+describe('sshForwardArgv', () => {
+  it('forwards only loopback ports and carries no remote command', async () => {
+    const { sshForwardArgv } = await import('../index.js')
+    const argv = sshForwardArgv({ host: 'peer.lan', user: 'me' }, { localPort: 41000, remotePort: 47_123, connectTimeoutMs: 8000 })
+    assert.deepEqual(argv.slice(0, 2), ['ssh', '-T'])
+    const forward = argv.indexOf('-L')
+    assert.equal(argv[forward + 1], '127.0.0.1:41000:127.0.0.1:47123')
+    assert.ok(argv.includes('-N'))
+    assert.equal(argv[argv.length - 2], '--')
+    assert.equal(argv[argv.length - 1], 'peer.lan')
+    assert.ok(!argv.includes('me@peer.lan'))
+    assert.throws(() => sshForwardArgv({ host: 'peer.lan' }, { localPort: 0, remotePort: 1, connectTimeoutMs: 1000 }), /local port/)
+  })
+})
+
 describe('sshArgv', () => {
   it('is non-interactive and bounded', () => {
     const argv = sshArgv({ host: 'dev.lan' }, 'true', { connectTimeoutMs: 9_500 })

@@ -15,7 +15,7 @@ import type { AcpSessionClient, AcpTransport, AcpUpdate } from './acp.js'
 import { createTaskParser } from './headless.js'
 import { InstanceStore, instanceSummary, validateInstance } from './instances.js'
 import type { ProbeRecord, RemoteInstance, StoreSnapshot } from './instances.js'
-import { acpCommand, probeCommand, taskCommand } from './platform.js'
+import { acpCommand, powershellCommand, probeCommand, taskCommand } from './platform.js'
 import { decompressFrames, historyCommand, parseSessionLog } from './history.js'
 import type { HistoryMessage, HistoryParse } from './history.js'
 import type { Platform } from './platform.js'
@@ -25,7 +25,8 @@ import { secretsPathFor, SecretStore, assertSecret } from './secrets.js'
 import { StringDecoder } from 'node:string_decoder'
 import { displayPath } from './settings.js'
 import type { ServiceSettings } from './settings.js'
-import { ASKPASS_SCRIPT, askpassEnv, parseProbeOutput, shellQuote, sshArgv, sshTargetOf } from './shell.js'
+import { ASKPASS_SCRIPT, askpassEnv, parseProbeOutput, shellQuote, sshArgv, sshForwardArgv, sshTargetOf } from './shell.js'
+import { SessionBridge } from './session-bridge.js'
 import type { ProbeFacts } from './shell.js'
 import { approvalSubject, NATIVE_ACTIONS, validateRequest } from './tool.js'
 import type { AgentLike, HostContext, JobChunk, SubprocessHandle } from './contracts.js'
@@ -149,6 +150,9 @@ export class RemoteInstanceService {
   private askpassDirectory?: string
   private askpassPath?: string
   private readonly acpFactory: AcpFactory | undefined
+  private readonly bridgeFactory: ((instance: RemoteInstance) => SessionBridge) | undefined
+  private readonly bridges = new Map<string, SessionBridge>()
+  private readonly transportOverride: 'bridge' | 'acp' | undefined
   private readonly links = new Map<string, Promise<AcpSessionClient>>()
   private readonly transcripts = new Map<string, Transcript>()
   private readonly logCache = new Map<string, { at: number; parse: HistoryParse }>()
@@ -156,12 +160,14 @@ export class RemoteInstanceService {
   constructor(
     readonly ctx: HostContext,
     readonly settings: ServiceSettings,
-    overrides: { readonly runner?: Runner; readonly store?: InstanceStore; readonly secrets?: SecretStore; readonly acp?: AcpFactory } = {},
+    overrides: { readonly runner?: Runner; readonly store?: InstanceStore; readonly secrets?: SecretStore; readonly acp?: AcpFactory; readonly bridge?: (instance: RemoteInstance) => SessionBridge; readonly transport?: 'bridge' | 'acp' } = {},
   ) {
     this.store = overrides.store ?? new InstanceStore({ file: settings.storeFile })
     this.secrets = overrides.secrets ?? new SecretStore(secretsPathFor(settings.storeFile))
     this.runner = overrides.runner ?? createRunner(ctx.subprocess, { active: this.active })
     this.acpFactory = overrides.acp
+    this.bridgeFactory = overrides.bridge
+    this.transportOverride = overrides.transport
   }
 
   /** 设备清单文件路径。 / The device-list path. */
@@ -449,6 +455,8 @@ export class RemoteInstanceService {
     await Promise.allSettled([...this.pending, ...[...this.active].map(child => child.waitForExit())])
     await Promise.allSettled(links.map(async creation => { try { const client = await creation; await client.dispose() } catch { /* the link never opened / 连接未建立。 */ } }))
     this.transcripts.clear()
+    for (const bridge of this.bridges.values()) await bridge.dispose().catch(() => undefined)
+    this.bridges.clear()
     if (this.askpassDirectory !== undefined) await rm(this.askpassDirectory, { recursive: true, force: true })
     this.results.clear()
     this.ownedJobs.clear()
@@ -457,6 +465,16 @@ export class RemoteInstanceService {
 
   /** 远端 DSH 自己的会话（ACP `session/list`）。 / The remote DSH's own conversations. */
   async remoteSessions(args: Record<string, unknown>): Promise<{ instance: string; cwd?: string; sessions: readonly unknown[] }> {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, 'name'))
+      const bridgeCwd = typeof args.cwd === 'string' && args.cwd ? args.cwd : undefined
+      const rows = await (await this.sessionBridge(bridgeInstance)).sessions()
+      return {
+        instance: bridgeInstance.name,
+        ...(bridgeCwd === undefined ? {} : { cwd: bridgeCwd }),
+        sessions: bridgeCwd === undefined ? rows : rows.filter(row => row.cwd === undefined || row.cwd === bridgeCwd),
+      }
+    }
     const instance = await this.findInstance(requireString(args.name, 'name'))
     const cwd = typeof args.cwd === 'string' && args.cwd ? args.cwd : undefined
     const client = await this.linkFor(instance)
@@ -466,6 +484,18 @@ export class RemoteInstanceService {
 
   /** 在远端目录里开一个新会话。 / Open a fresh conversation in a remote directory. */
   async newRemoteSession(args: Record<string, unknown>, options: ExecuteOptions): Promise<Record<string, unknown>> {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, 'name'))
+      const bridgeCwd = typeof args.cwd === 'string' && args.cwd ? args.cwd : bridgeInstance.cwd
+      await this.authorize(args, options)
+      const bridge = await this.sessionBridge(bridgeInstance)
+      const sessionId = await bridge.create(bridgeCwd)
+      const bridgePrompt = typeof args.prompt === 'string' ? args.prompt : ''
+      if (!bridgePrompt.trim()) return { instance: bridgeInstance.name, sessionId, ...(bridgeCwd === undefined ? {} : { cwd: bridgeCwd }), status: 'idle' }
+      if (bridgePrompt.length > MAX_PROMPT) throw new Error(`prompt is too large (max ${MAX_PROMPT} characters)`)
+      await bridge.send(sessionId, bridgePrompt)
+      return { instance: bridgeInstance.name, sessionId, ...(bridgeCwd === undefined ? {} : { cwd: bridgeCwd }), status: args.wait === false ? 'running' : 'accepted' }
+    }
     const instance = await this.findInstance(requireString(args.name, 'name'))
     const cwd = typeof args.cwd === 'string' && args.cwd ? args.cwd : instance.cwd
     if (!cwd) throw new Error('cwd is required to open a remote session')
@@ -487,6 +517,12 @@ export class RemoteInstanceService {
    * to what this plugin has seen since it opened the session.
    */
   async history(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, 'name'))
+      const bridgeSession = requireString(args.sessionId, 'sessionId')
+      const read = await (await this.sessionBridge(bridgeInstance)).history(bridgeSession)
+      return { instance: bridgeInstance.name, sessionId: bridgeSession, source: read.source, running: false, messages: read.messages }
+    }
     const instance = await this.findInstance(requireString(args.name, 'name'))
     const sessionId = requireString(args.sessionId, 'sessionId')
     const key = this.transcriptKey(instance.name, sessionId)
@@ -535,6 +571,16 @@ export class RemoteInstanceService {
 
   /** 往远端会话里发一条消息。 / Post one message into a remote conversation. */
   async sendMessage(args: Record<string, unknown>, options: ExecuteOptions): Promise<Record<string, unknown>> {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, 'name'))
+      const bridgeSession = requireString(args.sessionId, 'sessionId')
+      const bridgePrompt = typeof args.prompt === 'string' ? args.prompt : ''
+      if (!bridgePrompt.trim()) throw new Error('prompt is required')
+      if (bridgePrompt.length > MAX_PROMPT) throw new Error(`prompt is too large (max ${MAX_PROMPT} characters)`)
+      await this.authorize(args, options)
+      await (await this.sessionBridge(bridgeInstance)).send(bridgeSession, bridgePrompt)
+      return { instance: bridgeInstance.name, sessionId: bridgeSession, status: args.wait === false ? 'running' : 'accepted' }
+    }
     const instance = await this.findInstance(requireString(args.name, 'name'))
     const sessionId = requireString(args.sessionId, 'sessionId')
     const prompt = typeof args.prompt === 'string' ? args.prompt : ''
@@ -556,6 +602,12 @@ export class RemoteInstanceService {
 
   /** 取消远端会话当前回合。 / Cancel the running turn of a remote conversation. */
   async stopSession(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, 'name'))
+      const bridgeSession = requireString(args.sessionId, 'sessionId')
+      await (await this.sessionBridge(bridgeInstance)).stop(bridgeSession)
+      return { instance: bridgeInstance.name, sessionId: bridgeSession, status: 'cancelled' }
+    }
     const instance = await this.findInstance(requireString(args.name, 'name'))
     const sessionId = requireString(args.sessionId, 'sessionId')
     const client = await this.linkFor(instance)
@@ -567,12 +619,67 @@ export class RemoteInstanceService {
 
   /** 关闭远端会话并丢弃本插件保存的对话。 / Close a remote conversation and drop what this plugin kept. */
   async closeSession(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, 'name'))
+      const bridgeSession = requireString(args.sessionId, 'sessionId')
+      this.transcripts.delete(this.transcriptKey(bridgeInstance.name, bridgeSession))
+      return { instance: bridgeInstance.name, sessionId: bridgeSession, status: 'closed' }
+    }
     const instance = await this.findInstance(requireString(args.name, 'name'))
     const sessionId = requireString(args.sessionId, 'sessionId')
     const client = await this.linkFor(instance)
     await client.closeSession(sessionId)
     this.transcripts.delete(this.transcriptKey(instance.name, sessionId))
     return { instance: instance.name, sessionId, status: 'closed' }
+  }
+
+  /** 生产路径走桥接；测试注入的 ACP 替身仍走旧链路。 / Production uses the bridge; an injected ACP double keeps the old seam. */
+  private get useBridge(): boolean {
+    if (this.transportOverride !== undefined) return this.transportOverride === 'bridge'
+    return this.acpFactory === undefined
+  }
+
+  /** 一台设备的桥接；按设备名缓存，dispose 时统一关闭。 / The instance bridge, cached per name and closed on dispose. */
+  private async sessionBridge(instance: RemoteInstance): Promise<SessionBridge> {
+    const existing = this.bridges.get(instance.name)
+    if (existing) return existing
+    if (this.bridgeFactory !== undefined) {
+      const created = this.bridgeFactory(instance)
+      this.bridges.set(instance.name, created)
+      return created
+    }
+    const auth = instance.auth ?? 'key'
+    const target = sshTargetOf(instance)
+    let env: Record<string, string> | undefined
+    if (auth === 'password') {
+      const password = await this.secrets.get(instance.name)
+      if (password === undefined) throw new Error(`remote instance "${instance.name}" needs a password; re-add it with the password field`)
+      env = { ...askpassEnv(await this.askpassHelper()), DSH_REMOTE_PASSWORD: password }
+    }
+    const platform = instance.platform ?? 'posix'
+    const descriptor = platform === 'windows'
+      ? powershellCommand(`Get-Content -Raw "$(if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' })\\remote-instance-bridge.json"`)
+      : (instance.shell === '' ? 'cat "${DSH_HOME:-$HOME/.dsh}/remote-instance-bridge.json"' : `${shellQuote(instance.shell)} -lc ${shellQuote('cat "${DSH_HOME:-$HOME/.dsh}/remote-instance-bridge.json"')}`)
+    const created = new SessionBridge(undefined, {
+      exec: async argv => {
+        const result = await this.runner([...argv], { signal: this.lifetime.signal, timeoutMs: 30_000, ...(env === undefined ? {} : { env }) })
+        return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode ?? -1 }
+      },
+      spawn: argv => {
+        const child = this.ctx.subprocess.spawn({
+          argv: [...argv],
+          cwd: undefined,
+          ...(env === undefined ? {} : { env }),
+          signal: this.lifetime.signal,
+          stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
+        })
+        return { kill: () => child.terminate() }
+      },
+      commandArgv: command => sshArgv(target, command, { connectTimeoutMs: this.settings.connectTimeoutMs, auth }),
+      tunnelArgv: forward => sshForwardArgv(target, { ...forward, connectTimeoutMs: this.settings.connectTimeoutMs, auth }),
+    }, descriptor)
+    this.bridges.set(instance.name, created)
+    return created
   }
 
   /** 取得（或建立）一台设备的 ACP 连接；失败后下次调用会重连。 / Get or open the instance ACP link; a failure is retried next call. */

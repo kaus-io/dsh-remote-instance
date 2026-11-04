@@ -35,6 +35,15 @@ function sshArgv(target, remoteCommand, options) {
   argv.push("--", target.host, remoteCommand);
   return argv;
 }
+function sshForwardArgv(target, options) {
+  if (!target.host) throw new Error("host is required");
+  if (!Number.isSafeInteger(options.localPort) || options.localPort < 1 || options.localPort > 65535) throw new Error("local port must be 1-65535");
+  if (!Number.isSafeInteger(options.remotePort) || options.remotePort < 1 || options.remotePort > 65535) throw new Error("remote port must be 1-65535");
+  const argv = sshBaseArgv(target, options);
+  argv.push("-N", "-L", `127.0.0.1:${options.localPort}:127.0.0.1:${options.remotePort}`);
+  argv.push("--", target.host);
+  return argv;
+}
 function sshBaseArgv(target, options) {
   const auth = options.auth ?? "key";
   const argv = [
@@ -1496,6 +1505,214 @@ function assertSecret(value) {
 // src/service.ts
 import { StringDecoder as StringDecoder2 } from "node:string_decoder";
 
+// src/bridge-client.ts
+import { createServer as createServer2 } from "node:net";
+async function freePort() {
+  const server = createServer2();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  await new Promise((resolve) => server.close(() => resolve()));
+  if (port === 0) throw new Error("could not reserve a local port");
+  return port;
+}
+function parseDescriptor(text) {
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error("the peer bridge descriptor is not JSON");
+  }
+  if (!value || typeof value !== "object") throw new Error("the peer bridge descriptor is empty");
+  const record = value;
+  const port = record.port;
+  const token = record.token;
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error("the peer bridge descriptor has no valid port");
+  if (typeof token !== "string" || token.length < 16) throw new Error("the peer bridge descriptor has no valid token");
+  return { port, token };
+}
+var BridgeClient = class {
+  #options;
+  #descriptor;
+  #tunnel;
+  #localPort = 0;
+  constructor(options) {
+    this.#options = options;
+  }
+  /** 读对端的端口与 token。 / Read the peer's port and token. */
+  async discover() {
+    if (this.#descriptor) return this.#descriptor;
+    const command = this.#options.descriptorCommand ?? (this.#options.descriptorPath === void 0 ? void 0 : `cat ${shellQuote(this.#options.descriptorPath)}`);
+    if (command === void 0) throw new Error("bridge descriptor path is not configured");
+    const result = await this.#options.exec(this.#options.commandArgv(command));
+    if (result.exitCode !== 0) {
+      throw new Error(`cannot read the peer bridge descriptor: ${(result.stderr || result.stdout).trim().slice(0, 300) || `exit ${String(result.exitCode)}`}`);
+    }
+    const descriptor = parseDescriptor(result.stdout);
+    this.#descriptor = descriptor;
+    return descriptor;
+  }
+  /** 建隧道并返回本地端口。 / Open the tunnel and return its local port. */
+  async open() {
+    if (this.#localPort > 0) return this.#localPort;
+    const descriptor = await this.discover();
+    const localPort = await freePort();
+    const tunnel = this.#options.spawn(this.#options.tunnelArgv({ localPort, remotePort: descriptor.port }));
+    this.#tunnel = tunnel;
+    this.#localPort = localPort;
+    const deadline = Date.now() + (this.#options.openTimeoutMs ?? 1e4);
+    while (Date.now() < deadline) {
+      try {
+        await this.#request("/v1/info");
+        return localPort;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    await this.close();
+    throw new Error(`the ssh tunnel to the peer bridge did not become ready within ${String(this.#options.openTimeoutMs ?? 1e4)}ms`);
+  }
+  /** 调用一个桥接端点。 / Call one bridge endpoint. */
+  async call(path, init) {
+    const localPort = await this.open();
+    if (this.#localPort !== localPort) throw new Error("bridge tunnel is not open");
+    return await this.#request(path, init);
+  }
+  /** 关闭隧道。 / Close the tunnel. */
+  async close() {
+    const tunnel = this.#tunnel;
+    this.#tunnel = void 0;
+    this.#localPort = 0;
+    if (tunnel !== void 0) {
+      try {
+        tunnel.kill();
+      } catch {
+      }
+    }
+  }
+  async #request(path, init) {
+    const descriptor = this.#descriptor;
+    if (!descriptor) throw new Error("bridge is not discovered");
+    if (this.#localPort === 0) throw new Error("bridge tunnel is not open");
+    const fetchImpl = this.#options.fetchImpl ?? fetch;
+    const response = await fetchImpl(`http://127.0.0.1:${String(this.#localPort)}${path}`, {
+      method: init?.method ?? "GET",
+      headers: {
+        authorization: `Bearer ${descriptor.token}`,
+        ...init?.body === void 0 ? {} : { "content-type": "application/json" }
+      },
+      ...init?.body === void 0 ? {} : { body: JSON.stringify(init.body) }
+    });
+    const text = await response.text();
+    let value;
+    try {
+      value = text ? JSON.parse(text) : void 0;
+    } catch {
+      throw new Error(`the peer bridge returned non-JSON (${String(response.status)})`);
+    }
+    if (!response.ok) {
+      const message = value && typeof value === "object" && typeof value.error === "string" ? value.error : `HTTP ${String(response.status)}`;
+      throw new Error(`peer bridge: ${message}`);
+    }
+    return value;
+  }
+};
+
+// src/session-bridge.ts
+var SESSION_ID2 = /^[A-Za-z0-9_-]{1,128}$/;
+var SessionBridge = class {
+  #client;
+  #disposed = false;
+  constructor(descriptorPath, deps, descriptorCommand) {
+    this.#client = new BridgeClient({
+      exec: deps.exec,
+      spawn: deps.spawn,
+      commandArgv: deps.commandArgv,
+      tunnelArgv: deps.tunnelArgv,
+      ...deps.fetchImpl === void 0 ? {} : { fetchImpl: deps.fetchImpl },
+      ...descriptorPath === void 0 ? {} : { descriptorPath },
+      ...descriptorCommand === void 0 ? {} : { descriptorCommand }
+    });
+  }
+  /** 对端身份与能力。 / Peer identity and capabilities. */
+  async info() {
+    const value = await this.#client.call("/v1/info");
+    return {
+      hostname: typeof value.hostname === "string" ? value.hostname : "",
+      platform: value.platform === "windows" ? "windows" : "posix",
+      canPrompt: value.canPrompt === true,
+      ...typeof value.dshHome === "string" ? { dshHome: value.dshHome } : {}
+    };
+  }
+  /** 对端能看到的会话。 / Sessions the peer can see. */
+  async sessions() {
+    const value = await this.#client.call("/v1/sessions");
+    const rows = Array.isArray(value.sessions) ? value.sessions : [];
+    const out = [];
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const source = row;
+      if (typeof source.sessionId !== "string" || !SESSION_ID2.test(source.sessionId)) continue;
+      out.push({
+        sessionId: source.sessionId,
+        ...typeof source.cwd === "string" ? { cwd: source.cwd } : {},
+        ...typeof source.updatedAt === "number" ? { updatedAt: source.updatedAt } : {},
+        ...typeof source.running === "boolean" ? { running: source.running } : {},
+        ...typeof source.blank === "boolean" ? { blank: source.blank } : {}
+      });
+    }
+    return out;
+  }
+  /** 一个会话的历史。 / One session's history. */
+  async history(sessionId) {
+    if (!SESSION_ID2.test(sessionId)) throw new Error("invalid session id");
+    const value = await this.#client.call(`/v1/history?sessionId=${encodeURIComponent(sessionId)}`);
+    const rows = Array.isArray(value.messages) ? value.messages : [];
+    const messages = [];
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const source = row;
+      if (typeof source.role !== "string" || typeof source.text !== "string" || !source.text) continue;
+      messages.push({
+        role: source.role,
+        text: source.text,
+        ...typeof source.at === "number" ? { at: source.at } : {},
+        ...typeof source.status === "string" ? { status: source.status } : {}
+      });
+    }
+    return { messages, source: value.source === "log" ? "log" : "empty" };
+  }
+  /** 发一条消息。 / Send one message. */
+  async send(sessionId, text) {
+    if (!SESSION_ID2.test(sessionId)) throw new Error("invalid session id");
+    if (!text.trim()) throw new Error("text is required");
+    await this.#client.call("/v1/prompt", { method: "POST", body: { sessionId, text } });
+  }
+  /** 停止当前回合。 / Stop the running turn. */
+  async stop(sessionId) {
+    if (!SESSION_ID2.test(sessionId)) throw new Error("invalid session id");
+    await this.#client.call("/v1/cancel", { method: "POST", body: { sessionId } });
+  }
+  /** 新建一个会话。 / Create a session. */
+  async create(cwd) {
+    const value = await this.#client.call("/v1/create", {
+      method: "POST",
+      body: cwd === void 0 ? {} : { cwd }
+    });
+    if (typeof value.sessionId !== "string" || !SESSION_ID2.test(value.sessionId)) throw new Error("the peer bridge returned no session id");
+    return value.sessionId;
+  }
+  /** 关闭隧道。 / Close the tunnel. */
+  async dispose() {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    await this.#client.close();
+  }
+};
+
 // src/tool.ts
 var ACTIONS = ["instances", "add", "remove", "probe", "ask", "jobs", "status", "cancel", "sessions", "new", "history", "send", "stop", "close"];
 var READ_ACTIONS = /* @__PURE__ */ new Set(["instances", "probe", "jobs", "status", "sessions", "history"]);
@@ -1610,6 +1827,8 @@ var RemoteInstanceService = class {
     this.secrets = overrides.secrets ?? new SecretStore(secretsPathFor(settings.storeFile));
     this.runner = overrides.runner ?? createRunner(ctx.subprocess, { active: this.active });
     this.acpFactory = overrides.acp;
+    this.bridgeFactory = overrides.bridge;
+    this.transportOverride = overrides.transport;
   }
   ctx;
   settings;
@@ -1630,6 +1849,9 @@ var RemoteInstanceService = class {
   askpassDirectory;
   askpassPath;
   acpFactory;
+  bridgeFactory;
+  bridges = /* @__PURE__ */ new Map();
+  transportOverride;
   links = /* @__PURE__ */ new Map();
   transcripts = /* @__PURE__ */ new Map();
   logCache = /* @__PURE__ */ new Map();
@@ -1924,6 +2146,8 @@ ${message}
       }
     }));
     this.transcripts.clear();
+    for (const bridge of this.bridges.values()) await bridge.dispose().catch(() => void 0);
+    this.bridges.clear();
     if (this.askpassDirectory !== void 0) await rm(this.askpassDirectory, { recursive: true, force: true });
     this.results.clear();
     this.ownedJobs.clear();
@@ -1931,6 +2155,16 @@ ${message}
   }
   /** 远端 DSH 自己的会话（ACP `session/list`）。 / The remote DSH's own conversations. */
   async remoteSessions(args) {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, "name"));
+      const bridgeCwd = typeof args.cwd === "string" && args.cwd ? args.cwd : void 0;
+      const rows = await (await this.sessionBridge(bridgeInstance)).sessions();
+      return {
+        instance: bridgeInstance.name,
+        ...bridgeCwd === void 0 ? {} : { cwd: bridgeCwd },
+        sessions: bridgeCwd === void 0 ? rows : rows.filter((row) => row.cwd === void 0 || row.cwd === bridgeCwd)
+      };
+    }
     const instance = await this.findInstance(requireString(args.name, "name"));
     const cwd = typeof args.cwd === "string" && args.cwd ? args.cwd : void 0;
     const client = await this.linkFor(instance);
@@ -1939,6 +2173,18 @@ ${message}
   }
   /** 在远端目录里开一个新会话。 / Open a fresh conversation in a remote directory. */
   async newRemoteSession(args, options) {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, "name"));
+      const bridgeCwd = typeof args.cwd === "string" && args.cwd ? args.cwd : bridgeInstance.cwd;
+      await this.authorize(args, options);
+      const bridge = await this.sessionBridge(bridgeInstance);
+      const sessionId2 = await bridge.create(bridgeCwd);
+      const bridgePrompt = typeof args.prompt === "string" ? args.prompt : "";
+      if (!bridgePrompt.trim()) return { instance: bridgeInstance.name, sessionId: sessionId2, ...bridgeCwd === void 0 ? {} : { cwd: bridgeCwd }, status: "idle" };
+      if (bridgePrompt.length > MAX_PROMPT) throw new Error(`prompt is too large (max ${MAX_PROMPT} characters)`);
+      await bridge.send(sessionId2, bridgePrompt);
+      return { instance: bridgeInstance.name, sessionId: sessionId2, ...bridgeCwd === void 0 ? {} : { cwd: bridgeCwd }, status: args.wait === false ? "running" : "accepted" };
+    }
     const instance = await this.findInstance(requireString(args.name, "name"));
     const cwd = typeof args.cwd === "string" && args.cwd ? args.cwd : instance.cwd;
     if (!cwd) throw new Error("cwd is required to open a remote session");
@@ -1959,6 +2205,12 @@ ${message}
    * to what this plugin has seen since it opened the session.
    */
   async history(args) {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, "name"));
+      const bridgeSession = requireString(args.sessionId, "sessionId");
+      const read = await (await this.sessionBridge(bridgeInstance)).history(bridgeSession);
+      return { instance: bridgeInstance.name, sessionId: bridgeSession, source: read.source, running: false, messages: read.messages };
+    }
     const instance = await this.findInstance(requireString(args.name, "name"));
     const sessionId = requireString(args.sessionId, "sessionId");
     const key = this.transcriptKey(instance.name, sessionId);
@@ -2005,6 +2257,16 @@ ${message}
   }
   /** 往远端会话里发一条消息。 / Post one message into a remote conversation. */
   async sendMessage(args, options) {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, "name"));
+      const bridgeSession = requireString(args.sessionId, "sessionId");
+      const bridgePrompt = typeof args.prompt === "string" ? args.prompt : "";
+      if (!bridgePrompt.trim()) throw new Error("prompt is required");
+      if (bridgePrompt.length > MAX_PROMPT) throw new Error(`prompt is too large (max ${MAX_PROMPT} characters)`);
+      await this.authorize(args, options);
+      await (await this.sessionBridge(bridgeInstance)).send(bridgeSession, bridgePrompt);
+      return { instance: bridgeInstance.name, sessionId: bridgeSession, status: args.wait === false ? "running" : "accepted" };
+    }
     const instance = await this.findInstance(requireString(args.name, "name"));
     const sessionId = requireString(args.sessionId, "sessionId");
     const prompt = typeof args.prompt === "string" ? args.prompt : "";
@@ -2025,6 +2287,12 @@ ${message}
   }
   /** 取消远端会话当前回合。 / Cancel the running turn of a remote conversation. */
   async stopSession(args) {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, "name"));
+      const bridgeSession = requireString(args.sessionId, "sessionId");
+      await (await this.sessionBridge(bridgeInstance)).stop(bridgeSession);
+      return { instance: bridgeInstance.name, sessionId: bridgeSession, status: "cancelled" };
+    }
     const instance = await this.findInstance(requireString(args.name, "name"));
     const sessionId = requireString(args.sessionId, "sessionId");
     const client = await this.linkFor(instance);
@@ -2035,12 +2303,63 @@ ${message}
   }
   /** 关闭远端会话并丢弃本插件保存的对话。 / Close a remote conversation and drop what this plugin kept. */
   async closeSession(args) {
+    if (this.useBridge) {
+      const bridgeInstance = await this.findInstance(requireString(args.name, "name"));
+      const bridgeSession = requireString(args.sessionId, "sessionId");
+      this.transcripts.delete(this.transcriptKey(bridgeInstance.name, bridgeSession));
+      return { instance: bridgeInstance.name, sessionId: bridgeSession, status: "closed" };
+    }
     const instance = await this.findInstance(requireString(args.name, "name"));
     const sessionId = requireString(args.sessionId, "sessionId");
     const client = await this.linkFor(instance);
     await client.closeSession(sessionId);
     this.transcripts.delete(this.transcriptKey(instance.name, sessionId));
     return { instance: instance.name, sessionId, status: "closed" };
+  }
+  /** 生产路径走桥接；测试注入的 ACP 替身仍走旧链路。 / Production uses the bridge; an injected ACP double keeps the old seam. */
+  get useBridge() {
+    if (this.transportOverride !== void 0) return this.transportOverride === "bridge";
+    return this.acpFactory === void 0;
+  }
+  /** 一台设备的桥接；按设备名缓存，dispose 时统一关闭。 / The instance bridge, cached per name and closed on dispose. */
+  async sessionBridge(instance) {
+    const existing = this.bridges.get(instance.name);
+    if (existing) return existing;
+    if (this.bridgeFactory !== void 0) {
+      const created2 = this.bridgeFactory(instance);
+      this.bridges.set(instance.name, created2);
+      return created2;
+    }
+    const auth = instance.auth ?? "key";
+    const target = sshTargetOf(instance);
+    let env;
+    if (auth === "password") {
+      const password = await this.secrets.get(instance.name);
+      if (password === void 0) throw new Error(`remote instance "${instance.name}" needs a password; re-add it with the password field`);
+      env = { ...askpassEnv(await this.askpassHelper()), DSH_REMOTE_PASSWORD: password };
+    }
+    const platform = instance.platform ?? "posix";
+    const descriptor = platform === "windows" ? powershellCommand(`Get-Content -Raw "$(if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' })\\remote-instance-bridge.json"`) : instance.shell === "" ? 'cat "${DSH_HOME:-$HOME/.dsh}/remote-instance-bridge.json"' : `${shellQuote(instance.shell)} -lc ${shellQuote('cat "${DSH_HOME:-$HOME/.dsh}/remote-instance-bridge.json"')}`;
+    const created = new SessionBridge(void 0, {
+      exec: async (argv) => {
+        const result = await this.runner([...argv], { signal: this.lifetime.signal, timeoutMs: 3e4, ...env === void 0 ? {} : { env } });
+        return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode ?? -1 };
+      },
+      spawn: (argv) => {
+        const child = this.ctx.subprocess.spawn({
+          argv: [...argv],
+          cwd: void 0,
+          ...env === void 0 ? {} : { env },
+          signal: this.lifetime.signal,
+          stdio: { stdin: "pipe", stdout: "pipe", stderr: "pipe" }
+        });
+        return { kill: () => child.terminate() };
+      },
+      commandArgv: (command) => sshArgv(target, command, { connectTimeoutMs: this.settings.connectTimeoutMs, auth }),
+      tunnelArgv: (forward) => sshForwardArgv(target, { ...forward, connectTimeoutMs: this.settings.connectTimeoutMs, auth })
+    }, descriptor);
+    this.bridges.set(instance.name, created);
+    return created;
   }
   /** 取得（或建立）一台设备的 ACP 连接；失败后下次调用会重连。 / Get or open the instance ACP link; a failure is retried next call. */
   async linkFor(instance) {
@@ -2418,6 +2737,7 @@ export {
   ASKPASS_SCRIPT,
   AcpClient,
   AcpConnectionError,
+  BridgeClient,
   InstanceStore,
   MAX_LOG_BYTES,
   NAME_PATTERN,
@@ -2425,6 +2745,7 @@ export {
   READ_ACTIONS,
   RemoteInstanceService,
   SecretStore,
+  SessionBridge,
   TOOL_DESCRIPTION,
   TOOL_NAME,
   apply,
@@ -2458,6 +2779,7 @@ export {
   secretsPathFor,
   shellQuote,
   sshArgv,
+  sshForwardArgv,
   startBridge,
   taskCommand,
   validateInstance,

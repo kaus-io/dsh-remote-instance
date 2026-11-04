@@ -14,6 +14,8 @@ export interface SessionBridgeDeps {
   readonly spawn: (argv: readonly string[]) => { kill(): void }
   readonly commandArgv: (command: string) => readonly string[]
   readonly tunnelArgv: (forward: { readonly localPort: number; readonly remotePort: number }) => readonly string[]
+  /** 便于测试的 fetch 替身。 / Injectable fetch for tests. */
+  readonly fetchImpl?: typeof fetch
 }
 
 /** 一个会话摘要。 / One session row. */
@@ -54,6 +56,7 @@ export class SessionBridge {
       spawn: deps.spawn,
       commandArgv: deps.commandArgv,
       tunnelArgv: deps.tunnelArgv,
+      ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
       ...(descriptorPath === undefined ? {} : { descriptorPath }),
       ...(descriptorCommand === undefined ? {} : { descriptorCommand }),
     })

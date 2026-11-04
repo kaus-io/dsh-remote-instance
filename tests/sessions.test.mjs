@@ -122,7 +122,7 @@ describe('ACP link failures', () => {
       terminate() {},
       waitForExit: async () => undefined,
     })
-    const service = new RemoteInstanceService(ctx, settings)
+    const service = new RemoteInstanceService(ctx, settings, { transport: 'acp' })
     await service.execute({ action: 'add', name: 'dead', host: 'dead.lan', user: 'me', password: 'pw' }, { source: 'ui' })
     await assert.rejects(
       () => service.execute({ action: 'sessions', name: 'dead' }, { source: 'ui' }),
