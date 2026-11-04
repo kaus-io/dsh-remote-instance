@@ -99,7 +99,7 @@ npm publish                       # scoped 包已声明 publishConfig.access=pub
 
 - 兼容范围在 `engines.dsh`（当前 `>=0.2.1-rc.5 <0.3.0`）：安装器在 pnpm 之前就检查。DSH 升到 0.3 之前必须同步改，否则新装会被拒；旧版本用户也装不上。
 - `repository` / `homepage` 故意留空（不编造地址）；确定仓库 URL 后补上，npm 页面才会显示来源。
-- 发布后用户的装法：`dsh plugin --profile web add @kaus-io/dsh-remote-instance`，或 Plugins → Add plugin 填 `@kaus-io/dsh-remote-instance@1.0.0`；本地 `link:` 与 npm 安装互斥，换装前先卸掉旧源。
+- 发布后用户的装法：`dsh plugin --profile web add @kaus-io/dsh-remote-instance`，或 Plugins → Add plugin 填 `@kaus-io/dsh-remote-instance@1.0.0-alpha01`；本地 `link:` 与 npm 安装互斥，换装前先卸掉旧源。
 - 想出现在 Discover：托管一份插件市场索引 JSON（format 1，用 `@deepseek-ai/dsh-plugin-market-index` 校验），在其中列 `name@version` 和可选 `registry`，用户把索引 URL 加到 Discover。
 - 刚发布的版本可能被 pnpm 的 `minimumReleaseAge` 供应链策略暂时挡住，装到的可能不是最新版。
 
