@@ -3,6 +3,7 @@
   "version": "1.0.0-alpha01",
   "description": "Remote DSH instances over SSH: register another device's dsh, probe it, and dispatch tasks to its agent as parallel background jobs",
   "type": "module",
+  "packageManager": "pnpm@10.28.2",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -46,6 +47,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json",
+    "dist-tag": "node scripts/dist-tag.mjs",
     "test": "node scripts/build.mjs && node --test tests/*.test.mjs"
   },
   "dsh": {

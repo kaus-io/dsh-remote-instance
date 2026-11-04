@@ -25,6 +25,14 @@
 - UI 只调用 `/remote-instance/observe`（只读）与 `/remote-instance/action`（显式操作），必须带 `x-ri-observe: 1` / `x-ri-action: 1` 头；端点鉴权由 Host 的 `connection.admit` 决定，客户端的头不是授权。
 - 不手改生成的 `client.js` / `index.js`；改 `src/` 后跑 `node scripts/build.mjs`。
 
+## 发布与 CI
+
+- `.github/workflows/ci.yml`：push 到 `main`/`master` 与 PR 上跑 `typecheck`、`build --check`、`pnpm test`；三者必须绿，且产物必须已提交。
+- `.github/workflows/release.yml`：GitHub Release `published` 触发。先要求 release tag 等于 `v<package.json version>`（或裸版本号），再跑同一套检查，拒绝已存在的 npm 版本，最后用 `scripts/dist-tag.mjs` 推导 dist-tag 发布：稳定版 `latest`，预发布 `alpha`/`beta`/`rc`。
+- CI 不改写版本号：版本只有 `package.json` 一个来源。发版顺序固定为「bump → rebuild → commit → 打 tag → 建 release」。
+- 仓库 secret `NPM_TOKEN` 必须能发布 `@kaus-io` 下的包；令牌不写进任何文件。要 provenance 时再加 `id-token: write` 与 `--provenance`。
+- 预发布绝不能发成 `latest`，否则用户默认装到 alpha；dist-tag 交给脚本推导，不要在 workflow 里手写 `--tag`。
+
 ## 提交前
 
 ```sh
