@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { versionProblems } from '../scripts/check-versions.mjs'
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { readVersionInputs, versionProblems } from '../scripts/check-versions.mjs'
 
 const VERSION = '1.0.0-alpha01'
 
@@ -10,6 +13,30 @@ const clean = {
   readme: '```sh\ndsh plugin --profile web add @kaus-io/dsh-remote-instance@1.0.0-alpha01\n```\n',
   changelog: `# 更新日志\n\n## ${VERSION}\n\n- 首个版本\n`,
 }
+
+describe('readVersionInputs', () => {
+  it('checks pinned versions in the separate usage README', async () => {
+    const root = await mkdtemp(join(await realpath(tmpdir()), 'dsh-remote-versions-'))
+    try {
+      await mkdir(join(root, 'docs'))
+      await Promise.all([
+        writeFile(join(root, 'package.json'), JSON.stringify({ version: VERSION })),
+        writeFile(join(root, 'client.js'), clean.clientSource),
+        writeFile(join(root, 'README.md'), '### DSH Remote Instance\n\n[传送门](<docs/README.md>)。\n'),
+        writeFile(join(root, 'docs', 'README.md'), clean.readme),
+        writeFile(join(root, 'CHANGELOG.md'), clean.changelog),
+      ])
+      const inputs = await readVersionInputs(root)
+      assert.match(inputs.readme, /### DSH Remote Instance/)
+      assert.deepEqual(versionProblems(inputs), [])
+      await writeFile(join(root, 'docs', 'README.md'), clean.readme.replaceAll(VERSION, '0.9.0'))
+      assert.match(versionProblems(await readVersionInputs(root))[0], /README\.md pins "0\.9\.0"/)
+    } finally {
+      assert.equal(await realpath(root), root)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('versionProblems', () => {
   it('accepts manifest, build, README, and CHANGELOG in agreement', () => {

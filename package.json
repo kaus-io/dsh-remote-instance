@@ -41,6 +41,7 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "docs/README.md",
     "CHANGELOG.md",
     "AGENTS.md"
   ],

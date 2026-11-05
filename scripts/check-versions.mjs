@@ -51,12 +51,13 @@ export function versionProblems(input) {
 /** 读取仓库内参与检查的文件。 / Read the files this check inspects. */
 export async function readVersionInputs(root, tag) {
   const packageJson = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
-  const [clientSource, readme, changelog] = await Promise.all([
+  const [clientSource, overview, usage, changelog] = await Promise.all([
     readFile(join(root, 'client.js'), 'utf8'),
     readFile(join(root, 'README.md'), 'utf8'),
+    readFile(join(root, 'docs', 'README.md'), 'utf8'),
     readFile(join(root, 'CHANGELOG.md'), 'utf8'),
   ])
-  return { version: packageJson.version, clientSource, readme, changelog, tag }
+  return { version: packageJson.version, clientSource, readme: `${overview}\n${usage}`, changelog, tag }
 }
 
 const isMain = process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === import.meta.url
