@@ -1,8 +1,6 @@
 ### DSH Remote Instance
 
-![language-typescript](https://img.shields.io/badge/language-typescript-orange.svg)
-[![license-MIT](https://img.shields.io/badge/license-MIT-blue)](<LICENSE>)
-[![updates-更新日志](https://img.shields.io/badge/updates-更新日志-brightgreen)](<CHANGELOG.md>)
+![language-typescript](https://img.shields.io/badge/language-typescript-orange.svg) [![license-MIT](https://img.shields.io/badge/license-MIT-blue)](<LICENSE>) [![updates-更新日志](https://img.shields.io/badge/updates-更新日志-brightgreen)](<CHANGELOG.md>)
 
 ### 介绍
 
